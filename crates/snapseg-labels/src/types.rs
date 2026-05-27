@@ -171,6 +171,24 @@ pub enum PromptRecord {
     },
 }
 
+/// JSON shape for `polygon.json`. Vertices in image pixel coordinates,
+/// f32 to preserve the subpixel refinement (max_displacement is typically
+/// a few pixels but accuracy targets ~0.1 px). `confidence` is parallel
+/// to `vertices`; both vecs always have the same length.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolygonJson {
+    /// On-disk schema version; should match [`SCHEMA_VERSION`] at save time.
+    pub schema_version: String,
+    /// Closed polygon as ordered `[x, y]` pairs in source-image pixel space.
+    /// The polygon is implicitly closed: the last vertex does not repeat
+    /// the first.
+    pub vertices: Vec<[f32; 2]>,
+    /// Per-vertex confidence (peak gradient magnitude from subpixel
+    /// refinement). Parallel to `vertices`. Zero means the refinement
+    /// was rejected and the vertex sits at the marching-squares position.
+    pub confidence: Vec<f32>,
+}
+
 /// Filesystem root holding every label produced by snapseg. Today this
 /// is a flat directory of `<sha>/` subdirectories; the schema versions
 /// the directory layout for future evolution.

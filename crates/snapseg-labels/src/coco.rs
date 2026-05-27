@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{LabelError, LabelQuality, Provenance, SCHEMA_VERSION};
+use crate::{LabelError, LabelQuality, PolygonJson, Provenance, SCHEMA_VERSION};
 
 /// Options controlling the conversion.
 #[derive(Debug, Clone)]
@@ -106,13 +106,19 @@ pub struct CocoAnnotation {
     pub iscrowd: u32,
 }
 
-/// Mask payload for [`CocoAnnotation::segmentation`].
+/// Polygon or uncompressed RLE segmentation. COCO consumers expect a
+/// JSON array of arrays for polygons and a `{counts, size}` object for
+/// RLE — `serde(untagged)` lets both shapes coexist on the same field.
 ///
-/// Only uncompressed RLE today; polygon and compressed RLE land with
-/// subpixel edges in M3.
+/// Variant ordering matters here: `Polygon` is listed first so a JSON
+/// array deserializes as `Polygon` rather than getting misclassified.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CocoSegmentation {
+    /// Polygon segmentation. Outer Vec for multiple polygons (always
+    /// one element today); inner Vec is interleaved `[x1, y1, x2, y2,
+    /// …]` in source-image pixel coordinates.
+    Polygon(Vec<Vec<f64>>),
     /// Uncompressed column-major RLE.
     UncompressedRle {
         /// Alternating background/foreground run-lengths starting from
@@ -253,7 +259,11 @@ fn read_meta(label_dir: &Path) -> Result<Provenance, LabelError> {
     Ok(prov)
 }
 
-/// Build one image + one annotation from a single label directory.
+// why this is long: builds one COCO image+annotation pair, with two
+// segmentation paths (polygon when polygon.json is present, RLE fallback
+// from mask.png otherwise) plus the dimension / artifact checks that
+// must run in order before we choose between them. Splitting would
+// scatter the order across helpers and obscure the fallback logic.
 fn label_to_coco_entries(
     label_dir: &Path,
     meta: Provenance,
@@ -271,7 +281,9 @@ fn label_to_coco_entries(
         });
     }
 
-    // mask.png — load, validate dimensions, encode RLE.
+    // mask.png — load, validate dimensions. Used for the RLE fallback
+    // path; even when polygon.json is present we still validate the mask
+    // matches the source so the dataset is internally consistent.
     let mask_path = label_dir.join("mask.png");
     if !mask_path.exists() {
         return Err(LabelError::MissingArtifact {
@@ -288,9 +300,32 @@ fn label_to_coco_entries(
             mw, mh, meta.source_image_width, meta.source_image_height, id,
         )));
     }
-    let raw = mask_img.into_raw();
-    let (bbox, area) = mask_bbox_and_area(&raw, mh as usize, mw as usize);
-    let counts = encode_rle(&raw, mh as usize, mw as usize);
+
+    // Polygon segmentation when polygon.json is present; otherwise RLE.
+    let polygon_path = label_dir.join("polygon.json");
+    let (bbox, area, segmentation) = if polygon_path.exists() {
+        let s = fs::read_to_string(&polygon_path)?;
+        let polygon: PolygonJson = serde_json::from_str(&s)?;
+        let flat: Vec<f64> = polygon
+            .vertices
+            .iter()
+            .flat_map(|v| [v[0] as f64, v[1] as f64])
+            .collect();
+        let (bbox, area) = polygon_bbox_and_area(&polygon.vertices);
+        (bbox, area, CocoSegmentation::Polygon(vec![flat]))
+    } else {
+        let raw = mask_img.into_raw();
+        let (bbox, area) = mask_bbox_and_area(&raw, mh as usize, mw as usize);
+        let counts = encode_rle(&raw, mh as usize, mw as usize);
+        (
+            bbox,
+            area,
+            CocoSegmentation::UncompressedRle {
+                counts,
+                size: [mh, mw],
+            },
+        )
+    };
 
     let note = build_note(&meta);
     let file_name = format!("{id}/image.png");
@@ -310,13 +345,54 @@ fn label_to_coco_entries(
         category_id: 1,
         bbox,
         area,
-        segmentation: CocoSegmentation::UncompressedRle {
-            counts,
-            size: [mh, mw],
-        },
+        segmentation,
         iscrowd: 0,
     };
     Ok((image, annotation))
+}
+
+/// Compute `[x, y, w, h]` bbox in float image-space and shoelace area
+/// from a polygon's vertices. The polygon is treated as implicitly
+/// closed: the last vertex pairs with the first.
+///
+/// Returns `([0.0, 0.0, 0.0, 0.0], 0.0)` if the polygon has fewer than
+/// three vertices (degenerate; no area).
+fn polygon_bbox_and_area(vertices: &[[f32; 2]]) -> ([f64; 4], f64) {
+    if vertices.len() < 3 {
+        return ([0.0, 0.0, 0.0, 0.0], 0.0);
+    }
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for v in vertices {
+        let x = v[0] as f64;
+        let y = v[1] as f64;
+        if x < min_x {
+            min_x = x;
+        }
+        if y < min_y {
+            min_y = y;
+        }
+        if x > max_x {
+            max_x = x;
+        }
+        if y > max_y {
+            max_y = y;
+        }
+    }
+    let n = vertices.len();
+    let mut sum: f64 = 0.0;
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let xi = vertices[i][0] as f64;
+        let yi = vertices[i][1] as f64;
+        let xj = vertices[j][0] as f64;
+        let yj = vertices[j][1] as f64;
+        sum += xi * yj - xj * yi;
+    }
+    let area = 0.5 * sum.abs();
+    ([min_x, min_y, max_x - min_x, max_y - min_y], area)
 }
 
 /// Encode a row-major u8 mask as uncompressed COCO RLE
@@ -416,7 +492,7 @@ mod tests {
     use snapseg_core::{GrayImage, Point2, Polarity, Prompt, PromptSession};
 
     use crate::{
-        LabelDir, ModelProvenance, OperatorNote, ProvenanceInputs, RuntimeProvenance,
+        LabelDir, ModelProvenance, OperatorNote, PolygonJson, ProvenanceInputs, RuntimeProvenance,
         prompts_to_json,
     };
 
@@ -501,9 +577,17 @@ mod tests {
                 prompts,
                 &mask,
                 None,
+                None,
                 make_inputs(LabelQuality::Good),
             )
             .expect("save");
+
+        // No polygon.json should exist when polygon arg was None; this
+        // makes the RLE-fallback precondition visible in the test.
+        assert!(
+            !label.dir.join("polygon.json").exists(),
+            "polygon.json should not exist when polygon arg is None"
+        );
 
         let ds = convert_dir(tmp.path(), ConvertOptions::default()).expect("convert_dir");
 
@@ -537,7 +621,10 @@ mod tests {
         }
 
         // RLE roundtrip: decode back to a 4x4 mask and compare.
-        let CocoSegmentation::UncompressedRle { counts, size } = &ann.segmentation;
+        let (counts, size) = match &ann.segmentation {
+            CocoSegmentation::UncompressedRle { counts, size } => (counts, size),
+            other => panic!("expected UncompressedRle, got {other:?}"),
+        };
         assert_eq!(*size, [4, 4]);
         // Sanity: counts sum to total pixels.
         let total: u32 = counts.iter().copied().sum();
@@ -570,6 +657,7 @@ mod tests {
             p1,
             &mask,
             None,
+            None,
             make_inputs(LabelQuality::Good),
         )
         .expect("save good");
@@ -585,6 +673,7 @@ mod tests {
             &gray,
             p2,
             &mask,
+            None,
             None,
             make_inputs(LabelQuality::Reject),
         )
@@ -635,8 +724,16 @@ mod tests {
         let mask = make_mask_4x4();
         let (s, o) = one_click();
         let p = prompts_to_json(&s, &o).expect("prompts");
-        dir.save(None, &gray, p, &mask, None, make_inputs(LabelQuality::Good))
-            .expect("save");
+        dir.save(
+            None,
+            &gray,
+            p,
+            &mask,
+            None,
+            None,
+            make_inputs(LabelQuality::Good),
+        )
+        .expect("save");
 
         // Orphan .partial/ from a hypothetical crashed write.
         fs::create_dir_all(tmp.path().join("orphan.partial")).expect("mkdir partial");
@@ -644,6 +741,97 @@ mod tests {
         let ds = convert_dir(tmp.path(), ConvertOptions::default()).expect("convert_dir");
         assert_eq!(ds.images.len(), 1);
         assert_eq!(ds.annotations.len(), 1);
+    }
+
+    #[test]
+    fn convert_uses_polygon_when_present() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut dir = LabelDir::new(tmp.path().to_path_buf());
+
+        // 16x16 image (4x4 isn't big enough to embed a (2.5,2.5)..(12,12)
+        // triangle).
+        let data =
+            Array2::from_shape_vec((16, 16), (0u8..=255).take(256).collect()).expect("16x16");
+        let gray = GrayImage::from_array(data);
+        let mask = Array2::<bool>::default((16, 16));
+        let (session, offsets) = one_click();
+        let prompts = prompts_to_json(&session, &offsets).expect("prompts_to_json");
+
+        let polygon = PolygonJson {
+            schema_version: SCHEMA_VERSION.to_string(),
+            vertices: vec![[2.5, 2.5], [10.5, 4.0], [5.0, 12.0]],
+            confidence: vec![0.9, 0.95, 0.8],
+        };
+
+        dir.save(
+            None,
+            &gray,
+            prompts,
+            &mask,
+            None,
+            Some(&polygon),
+            make_inputs(LabelQuality::Good),
+        )
+        .expect("save");
+
+        let ds = convert_dir(tmp.path(), ConvertOptions::default()).expect("convert_dir");
+        assert_eq!(ds.annotations.len(), 1);
+        let ann = &ds.annotations[0];
+
+        let flat = match &ann.segmentation {
+            CocoSegmentation::Polygon(rings) => {
+                assert_eq!(rings.len(), 1, "snapseg emits one polygon per annotation");
+                rings[0].clone()
+            }
+            other => panic!("expected Polygon, got {other:?}"),
+        };
+        let want_flat = [2.5_f64, 2.5, 10.5, 4.0, 5.0, 12.0];
+        assert_eq!(flat.len(), want_flat.len());
+        for (got, want) in flat.iter().zip(want_flat.iter()) {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "polygon flat mismatch: got {flat:?}, want {want_flat:?}"
+            );
+        }
+
+        // bbox = [min_x, min_y, max_x - min_x, max_y - min_y]
+        //      = [2.5, 2.5, 8.0, 9.5]
+        let want_bbox = [2.5_f64, 2.5, 8.0, 9.5];
+        for (got, want) in ann.bbox.iter().zip(want_bbox.iter()) {
+            assert!(
+                (got - want).abs() < 0.01,
+                "bbox mismatch: got {:?}, want {:?}",
+                ann.bbox,
+                want_bbox
+            );
+        }
+
+        // Shoelace area:
+        // 0.5 * |2.5*4.0 - 10.5*2.5
+        //      + 10.5*12.0 - 5.0*4.0
+        //      + 5.0*2.5 - 2.5*12.0|
+        // = 0.5 * |72.25| = 36.125
+        assert!(
+            (ann.area - 36.125).abs() < 0.01,
+            "area mismatch: got {}",
+            ann.area
+        );
+    }
+
+    #[test]
+    fn polygon_segmentation_roundtrips_as_polygon() {
+        // Guard the serde(untagged) variant ordering: a JSON array of
+        // arrays must deserialize back as Polygon, not get misclassified.
+        let seg = CocoSegmentation::Polygon(vec![vec![0.0_f64, 0.0, 1.0, 0.0, 0.5, 1.0]]);
+        let json = serde_json::to_string(&seg).expect("serialize");
+        let back: CocoSegmentation = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            CocoSegmentation::Polygon(rings) => {
+                assert_eq!(rings.len(), 1);
+                assert_eq!(rings[0].len(), 6);
+            }
+            other => panic!("expected Polygon, got {other:?}"),
+        }
     }
 
     #[test]

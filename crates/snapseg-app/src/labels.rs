@@ -90,6 +90,7 @@ pub(crate) fn save_current_label(app: &mut SnapsegApp) -> Result<Label, LabelErr
         prompts,
         mask,
         logits,
+        None, // polygon — wired in M3-T05
         inputs,
     )
 }

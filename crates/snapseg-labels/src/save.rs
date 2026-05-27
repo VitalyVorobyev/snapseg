@@ -13,8 +13,8 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 
 use crate::types::{
-    Label, LabelDir, LabelError, ModelProvenance, OperatorNote, PromptSessionJson, Provenance,
-    RuntimeProvenance, SCHEMA_VERSION,
+    Label, LabelDir, LabelError, ModelProvenance, OperatorNote, PolygonJson, PromptSessionJson,
+    Provenance, RuntimeProvenance, SCHEMA_VERSION,
 };
 
 /// Caller-supplied portion of [`Provenance`]. [`LabelDir::save`]
@@ -63,6 +63,7 @@ impl LabelDir {
     /// - [`LabelError::Json`] / [`LabelError::TomlSer`] /
     ///   [`LabelError::Image`] when (de)serialization or PNG
     ///   encoding fails.
+    #[allow(clippy::too_many_arguments)]
     pub fn save(
         &mut self,
         image_path: Option<&Path>,
@@ -70,9 +71,12 @@ impl LabelDir {
         prompts: PromptSessionJson,
         mask: &ndarray::Array2<bool>,
         logits: Option<&ndarray::Array2<f32>>,
+        polygon: Option<&PolygonJson>,
         inputs: ProvenanceInputs,
     ) -> Result<Label, LabelError> {
-        save_impl(self, image_path, gray, prompts, mask, logits, inputs)
+        save_impl(
+            self, image_path, gray, prompts, mask, logits, polygon, inputs,
+        )
     }
 }
 
@@ -80,6 +84,7 @@ impl LabelDir {
 // breaking it into many small helpers would obscure the strict file
 // order (validate → hash → pick slot → stage → rename → cleanup) the
 // crash-safety argument depends on. Keep it as one readable script.
+#[allow(clippy::too_many_arguments)]
 fn save_impl(
     dir: &mut LabelDir,
     image_path: Option<&Path>,
@@ -87,6 +92,7 @@ fn save_impl(
     prompts: PromptSessionJson,
     mask: &ndarray::Array2<bool>,
     logits: Option<&ndarray::Array2<f32>>,
+    polygon: Option<&PolygonJson>,
     inputs: ProvenanceInputs,
 ) -> Result<Label, LabelError> {
     // --- validate inputs before touching the filesystem ---
@@ -105,6 +111,21 @@ fn save_impl(
                 l.dim(),
                 expected_dim,
             )));
+        }
+    }
+    if let Some(p) = polygon {
+        if p.vertices.len() != p.confidence.len() {
+            return Err(LabelError::InvalidInput(
+                "polygon vertices and confidence length mismatch".into(),
+            ));
+        }
+        if p.vertices
+            .iter()
+            .any(|v| !v[0].is_finite() || !v[1].is_finite())
+        {
+            return Err(LabelError::InvalidInput(
+                "polygon has non-finite vertex".into(),
+            ));
         }
     }
 
@@ -137,6 +158,7 @@ fn save_impl(
         &prompts,
         mask,
         logits,
+        polygon,
         &source_sha256,
         inputs,
     );
@@ -170,6 +192,7 @@ fn stage_artifacts(
     prompts: &PromptSessionJson,
     mask: &ndarray::Array2<bool>,
     logits: Option<&ndarray::Array2<f32>>,
+    polygon: Option<&PolygonJson>,
     source_sha256: &str,
     inputs: ProvenanceInputs,
 ) -> Result<(), LabelError> {
@@ -223,6 +246,13 @@ fn stage_artifacts(
     // prompts.json
     let prompts_str = serde_json::to_string_pretty(prompts)?;
     fs::write(partial.join("prompts.json"), prompts_str)?;
+
+    // polygon.json (optional). Validation already happened in save_impl
+    // before any FS work; here we only serialize and write.
+    if let Some(p) = polygon {
+        let polygon_str = serde_json::to_string_pretty(p)?;
+        fs::write(partial.join("polygon.json"), polygon_str)?;
+    }
 
     // meta.toml — complete the Provenance with the image-dependent
     // fields, then serialize.
@@ -387,7 +417,7 @@ mod tests {
         let prompts = prompts_to_json(&session, &offsets).expect("prompts_to_json");
 
         let label = dir
-            .save(None, &gray, prompts, &mask, None, make_inputs())
+            .save(None, &gray, prompts, &mask, None, None, make_inputs())
             .expect("save");
 
         // image.png — decodes to 4x4 grayscale.
@@ -448,7 +478,7 @@ mod tests {
         let prompts = prompts_to_json(&session, &offsets).expect("prompts_to_json");
 
         let err = dir
-            .save(None, &gray, prompts, &bad_mask, None, make_inputs())
+            .save(None, &gray, prompts, &bad_mask, None, None, make_inputs())
             .expect_err("dimension mismatch should error");
         match err {
             LabelError::InvalidInput(_) => {}
@@ -467,12 +497,12 @@ mod tests {
 
         let prompts1 = prompts_to_json(&session, &offsets).expect("prompts_to_json");
         let first = dir
-            .save(None, &gray, prompts1, &mask, None, make_inputs())
+            .save(None, &gray, prompts1, &mask, None, None, make_inputs())
             .expect("first save");
 
         let prompts2 = prompts_to_json(&session, &offsets).expect("prompts_to_json");
         let second = dir
-            .save(None, &gray, prompts2, &mask, None, make_inputs())
+            .save(None, &gray, prompts2, &mask, None, None, make_inputs())
             .expect("second save");
 
         assert_eq!(first.id.len(), 8, "first id is bare 8-hex");
@@ -499,7 +529,15 @@ mod tests {
         let prompts = prompts_to_json(&session, &offsets).expect("prompts_to_json");
 
         let label = dir
-            .save(None, &gray, prompts, &mask, Some(&logits), make_inputs())
+            .save(
+                None,
+                &gray,
+                prompts,
+                &mask,
+                Some(&logits),
+                None,
+                make_inputs(),
+            )
             .expect("save");
 
         let logits_path = label.dir.join("logits.png");
@@ -517,5 +555,142 @@ mod tests {
         let min = luma16.iter().copied().min().expect("non-empty");
         let max = luma16.iter().copied().max().expect("non-empty");
         assert!(max > min, "encoded logits are degenerate: {min}..{max}");
+    }
+
+    fn make_polygon_triangle() -> PolygonJson {
+        PolygonJson {
+            schema_version: SCHEMA_VERSION.to_string(),
+            vertices: vec![[1.25, 1.25], [3.5, 1.0], [2.0, 3.25]],
+            confidence: vec![0.9, 0.95, 0.8],
+        }
+    }
+
+    #[test]
+    fn save_with_polygon_writes_polygon_json() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut dir = LabelDir::new(tmp.path().to_path_buf());
+
+        let gray = make_gray_4x4();
+        let mask = make_mask_4x4();
+        let (session, offsets) = make_session_one_click();
+        let prompts = prompts_to_json(&session, &offsets).expect("prompts_to_json");
+        let polygon = make_polygon_triangle();
+
+        let label = dir
+            .save(
+                None,
+                &gray,
+                prompts,
+                &mask,
+                None,
+                Some(&polygon),
+                make_inputs(),
+            )
+            .expect("save");
+
+        let polygon_path = label.dir.join("polygon.json");
+        assert!(polygon_path.exists(), "polygon.json missing");
+
+        let s = std::fs::read_to_string(&polygon_path).expect("read polygon.json");
+        let parsed: PolygonJson = serde_json::from_str(&s).expect("parse polygon.json");
+        assert_eq!(parsed.schema_version, SCHEMA_VERSION);
+        assert_eq!(parsed.vertices.len(), 3);
+        assert_eq!(parsed.confidence.len(), 3);
+        for (got, want) in parsed.vertices.iter().zip(polygon.vertices.iter()) {
+            assert!((got[0] - want[0]).abs() < 1e-6);
+            assert!((got[1] - want[1]).abs() < 1e-6);
+        }
+        for (got, want) in parsed.confidence.iter().zip(polygon.confidence.iter()) {
+            assert!((got - want).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn save_polygon_length_mismatch_rejected() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut dir = LabelDir::new(tmp.path().to_path_buf());
+
+        let gray = make_gray_4x4();
+        let mask = make_mask_4x4();
+        let (session, offsets) = make_session_one_click();
+        let prompts = prompts_to_json(&session, &offsets).expect("prompts_to_json");
+
+        let bad_polygon = PolygonJson {
+            schema_version: SCHEMA_VERSION.to_string(),
+            vertices: vec![[1.0, 1.0], [2.0, 1.0], [1.5, 2.0]],
+            confidence: vec![0.9, 0.95],
+        };
+
+        let err = dir
+            .save(
+                None,
+                &gray,
+                prompts,
+                &mask,
+                None,
+                Some(&bad_polygon),
+                make_inputs(),
+            )
+            .expect_err("length mismatch should error");
+        match err {
+            LabelError::InvalidInput(msg) => {
+                assert!(msg.contains("length mismatch"), "unexpected message: {msg}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+
+        // No filesystem state should have been created (no slot dirs).
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "no FS entries should exist on validation failure"
+        );
+    }
+
+    #[test]
+    fn save_polygon_nonfinite_rejected() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut dir = LabelDir::new(tmp.path().to_path_buf());
+
+        let gray = make_gray_4x4();
+        let mask = make_mask_4x4();
+        let (session, offsets) = make_session_one_click();
+        let prompts = prompts_to_json(&session, &offsets).expect("prompts_to_json");
+
+        let bad_polygon = PolygonJson {
+            schema_version: SCHEMA_VERSION.to_string(),
+            vertices: vec![[f32::NAN, 0.0], [1.0, 1.0], [2.0, 0.5]],
+            confidence: vec![0.5, 0.5, 0.5],
+        };
+
+        let err = dir
+            .save(
+                None,
+                &gray,
+                prompts,
+                &mask,
+                None,
+                Some(&bad_polygon),
+                make_inputs(),
+            )
+            .expect_err("non-finite vertex should error");
+        match err {
+            LabelError::InvalidInput(msg) => {
+                assert!(msg.contains("non-finite"), "unexpected message: {msg}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "no FS entries should exist on validation failure"
+        );
     }
 }

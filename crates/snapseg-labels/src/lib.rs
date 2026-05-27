@@ -25,6 +25,6 @@ mod types;
 pub use prompts::prompts_to_json;
 pub use save::ProvenanceInputs;
 pub use types::{
-    Label, LabelDir, LabelError, LabelQuality, ModelProvenance, OperatorNote, PromptRecord,
-    PromptSessionJson, Provenance, RuntimeProvenance, SCHEMA_VERSION,
+    Label, LabelDir, LabelError, LabelQuality, ModelProvenance, OperatorNote, PolygonJson,
+    PromptRecord, PromptSessionJson, Provenance, RuntimeProvenance, SCHEMA_VERSION,
 };
