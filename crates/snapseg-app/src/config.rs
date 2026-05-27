@@ -39,6 +39,16 @@ pub struct AppConfig {
     /// click "Load MobileSAM…" as before.
     #[serde(default)]
     pub default_model: Option<ModelConfig>,
+
+    /// Absolute path to the `libonnxruntime` shared library `ort` should
+    /// `dlopen` at runtime. When set, snapseg exports it as
+    /// `ORT_DYLIB_PATH` before constructing any session — useful when
+    /// the system-installed onnxruntime is ABI-incompatible with the
+    /// pinned `ort` crate (e.g. Homebrew's onnxruntime is newer than
+    /// what `ort 2.0.0-rc.10` was built against). When absent, `ort`
+    /// uses its default search path.
+    #[serde(default)]
+    pub onnxruntime_path: Option<PathBuf>,
 }
 
 /// One model entry: same shape as a registry entry plus a per-part
@@ -148,6 +158,16 @@ mod tests {
         assert_eq!(model.name, "mobile-sam");
         assert_eq!(model.family, "mobile_sam");
         assert_eq!(model.parts.len(), 2);
+    }
+
+    #[test]
+    fn onnxruntime_path_parses() {
+        let f = write_tmp(r#"onnxruntime_path = "/opt/ort/libonnxruntime.dylib""#);
+        let cfg = AppConfig::load_from(f.path()).expect("parse");
+        assert_eq!(
+            cfg.onnxruntime_path.as_ref().and_then(|p| p.to_str()),
+            Some("/opt/ort/libonnxruntime.dylib"),
+        );
     }
 
     #[test]

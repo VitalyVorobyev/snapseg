@@ -127,14 +127,12 @@ pub(crate) fn try_load_model(
         "mobile_sam" => MobileSamSegmenter::from_parts(name.clone(), &parts, input_size, &config)
             .map(|s| Box::new(s) as Box<dyn InteractiveSegmenter>)
             .map_err(|e| format!("MobileSAM load: {e}")),
-        "ritm" => {
-            let seg = RitmSegmenter::new(name.clone(), (input_size, input_size));
-            Ok(Box::new(seg) as Box<dyn InteractiveSegmenter>)
-        }
-        "focalclick" => {
-            let seg = FocalClickSegmenter::new(name.clone(), (input_size, input_size));
-            Ok(Box::new(seg) as Box<dyn InteractiveSegmenter>)
-        }
+        "ritm" => RitmSegmenter::from_parts(name.clone(), &parts, input_size, &config)
+            .map(|s| Box::new(s) as Box<dyn InteractiveSegmenter>)
+            .map_err(|e| format!("RITM load: {e}")),
+        "focalclick" => FocalClickSegmenter::from_parts(name.clone(), &parts, input_size, &config)
+            .map(|s| Box::new(s) as Box<dyn InteractiveSegmenter>)
+            .map_err(|e| format!("FocalClick load: {e}")),
         other => Err(format!("unknown family '{other}'")),
     };
 

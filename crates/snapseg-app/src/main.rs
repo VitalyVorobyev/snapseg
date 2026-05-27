@@ -37,6 +37,13 @@ fn main() -> eframe::Result<()> {
     let app = match crate::config::AppConfig::load_default() {
         Ok(Some(cfg)) => {
             tracing::info!("loaded snapseg.toml");
+            // why this is unsafe: std::env::set_var is unsafe in the 2024
+            // edition because environment access isn't thread-safe. Done
+            // here in main, before any ort session or worker thread exists.
+            if let Some(p) = cfg.onnxruntime_path.as_ref() {
+                tracing::info!(path = %p.display(), "setting ORT_DYLIB_PATH from config");
+                unsafe { std::env::set_var("ORT_DYLIB_PATH", p) };
+            }
             SnapsegApp::with_config(cfg)
         }
         Ok(None) => {
