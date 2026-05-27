@@ -8,6 +8,7 @@
 *.onnx
 /labels/
 /scratch/
+/snapseg.toml
 
 # macOS
 .DS_Store

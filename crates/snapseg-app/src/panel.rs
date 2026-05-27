@@ -23,6 +23,9 @@ impl SnapsegApp {
         if ui.button("Load MobileSAM…").clicked() {
             self.load_mobile_sam_dialog();
         }
+        if ui.button("Reload config").clicked() {
+            self.reload_config();
+        }
 
         ui.add_space(8.0);
         ui.label("Click tool:");
@@ -145,6 +148,33 @@ impl SnapsegApp {
             ui.add_space(8.0);
             ui.separator();
             ui.label(format!("Last segment: {ms} ms"));
+        }
+    }
+
+    /// Re-read `./snapseg.toml` and re-apply. If the default_model
+    /// entry differs from the currently-loaded one, the new model is
+    /// queued for auto-load on the next frame. Other fields
+    /// (`label_dir`, `refine_edges`) take effect immediately.
+    pub(crate) fn reload_config(&mut self) {
+        match crate::config::AppConfig::load_default() {
+            Ok(Some(cfg)) => {
+                if let Some(dir) = cfg.label_dir {
+                    self.label_dir = snapseg_labels::LabelDir::new(dir);
+                }
+                if let Some(refine) = cfg.refine_edges {
+                    self.refine_edges = refine;
+                }
+                if let Some(model) = cfg.default_model {
+                    self.pending_autoload = Some(model);
+                }
+                self.last_save_status = Some("Config reloaded".into());
+            }
+            Ok(None) => {
+                self.last_save_status = Some("No snapseg.toml in cwd".into());
+            }
+            Err(e) => {
+                self.error = Some(format!("Config load failed: {e}"));
+            }
         }
     }
 

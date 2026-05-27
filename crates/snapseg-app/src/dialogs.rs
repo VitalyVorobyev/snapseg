@@ -1,8 +1,11 @@
-//! File-picker plumbing.
+//! File-picker plumbing and model-load dispatch.
 //!
 //! `rfd` opens platform-native dialogs; these methods translate user
 //! file selections into app state mutations and trigger the encoder
 //! pass synchronously. Async file dialogs are a future refactor.
+//!
+//! [`try_load_model`] is the shared dispatch point used by both the
+//! file-dialog path and the config auto-load path.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -10,7 +13,9 @@ use std::path::PathBuf;
 use eframe::egui;
 
 use snapseg_core::InteractiveSegmenter;
+use snapseg_models::focalclick::FocalClickSegmenter;
 use snapseg_models::mobile_sam::MobileSamSegmenter;
+use snapseg_models::ritm::RitmSegmenter;
 use snapseg_runtime::RuntimeConfig;
 
 use crate::app::SnapsegApp;
@@ -56,35 +61,17 @@ impl SnapsegApp {
             return;
         };
 
-        // Hash the ONNX files now, before moving them into `parts`, so
-        // we can record encoder/decoder identity in label provenance
-        // without re-reading the file later.
-        let encoder_sha256 = compute_sha256(&enc).ok();
-        let decoder_sha256 = compute_sha256(&dec).ok();
-
         let mut parts: HashMap<String, PathBuf> = HashMap::new();
         parts.insert("encoder".to_string(), enc);
         parts.insert("decoder".to_string(), dec);
 
-        let config = RuntimeConfig::default();
-        match MobileSamSegmenter::from_parts("mobile-sam".to_string(), &parts, 1024, &config) {
-            Ok(seg) => {
-                tracing::info!("MobileSAM loaded");
-                self.segmenter_label = Some(format!("{} ({})", seg.name(), "CPU"));
-                self.segmenter = Some(Box::new(seg));
-                self.segmenter_family = Some("mobile_sam".to_string());
-                self.segmenter_registry_name = Some("mobile-sam".to_string());
-                self.encoder_sha256 = encoder_sha256;
-                self.decoder_sha256 = decoder_sha256;
-                self.embedding_ready = false;
-                self.error = None;
-                self.run_set_image();
-            }
-            Err(e) => {
-                tracing::error!("MobileSAM load failed: {e}");
-                self.error = Some(format!("MobileSAM load: {e}"));
-            }
-        }
+        try_load_model(
+            self,
+            "mobile-sam".to_string(),
+            "mobile_sam".to_string(),
+            1024,
+            parts,
+        );
     }
 
     /// File-picker for the label root directory. On success, updates
@@ -97,6 +84,76 @@ impl SnapsegApp {
         if let Some(p) = picked {
             self.label_dir = snapseg_labels::LabelDir::new(p);
             self.last_save_status = None;
+        }
+    }
+
+    /// Run the pending auto-load scheduled by [`SnapsegApp::with_config`].
+    /// Called at the top of every `update` frame; the `take()` ensures it
+    /// executes at most once per construction. The encoder pass also runs
+    /// here if an image was already loaded before this tick.
+    pub(crate) fn tick_pending_autoload(&mut self, _ctx: &egui::Context) {
+        let Some(cfg) = self.pending_autoload.take() else {
+            return;
+        };
+        try_load_model(self, cfg.name, cfg.family, cfg.input_size, cfg.parts);
+    }
+}
+
+/// Build a segmenter for the given `family`, wire it into `app`, and run
+/// the encoder pass if an image is already loaded.
+///
+/// `parts` maps part names (e.g. `"encoder"`, `"decoder"`, `"model"`) to
+/// on-disk ONNX paths. SHA-256 digests of the encoder and decoder parts
+/// are computed and stored for label provenance.
+///
+/// Unknown family slugs are surfaced via `app.error`; this function never
+/// panics.
+// why this is long: arms per family + sha256 bookkeeping + error wiring;
+// splitting per-family would scatter context without reducing coupling.
+pub(crate) fn try_load_model(
+    app: &mut SnapsegApp,
+    name: String,
+    family: String,
+    input_size: u32,
+    parts: HashMap<String, PathBuf>,
+) {
+    // Hash whichever part files are present for label provenance.
+    let encoder_sha256 = parts.get("encoder").and_then(|p| compute_sha256(p).ok());
+    let decoder_sha256 = parts.get("decoder").and_then(|p| compute_sha256(p).ok());
+
+    let config = RuntimeConfig::default();
+
+    let result: Result<Box<dyn InteractiveSegmenter>, String> = match family.as_str() {
+        "mobile_sam" => MobileSamSegmenter::from_parts(name.clone(), &parts, input_size, &config)
+            .map(|s| Box::new(s) as Box<dyn InteractiveSegmenter>)
+            .map_err(|e| format!("MobileSAM load: {e}")),
+        "ritm" => {
+            let seg = RitmSegmenter::new(name.clone(), (input_size, input_size));
+            Ok(Box::new(seg) as Box<dyn InteractiveSegmenter>)
+        }
+        "focalclick" => {
+            let seg = FocalClickSegmenter::new(name.clone(), (input_size, input_size));
+            Ok(Box::new(seg) as Box<dyn InteractiveSegmenter>)
+        }
+        other => Err(format!("unknown family '{other}'")),
+    };
+
+    match result {
+        Ok(seg) => {
+            tracing::info!(family = %family, name = %name, "model loaded");
+            app.segmenter_label = Some(format!("{} (CPU)", seg.name()));
+            app.segmenter_family = Some(family);
+            app.segmenter_registry_name = Some(name);
+            app.encoder_sha256 = encoder_sha256;
+            app.decoder_sha256 = decoder_sha256;
+            app.embedding_ready = false;
+            app.error = None;
+            app.segmenter = Some(seg);
+            app.run_set_image();
+        }
+        Err(e) => {
+            tracing::error!("model load failed: {e}");
+            app.error = Some(e);
         }
     }
 }

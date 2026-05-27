@@ -82,6 +82,12 @@ pub struct SnapsegApp {
     /// Knobs for the refinement pass. Defaults from
     /// [`snapseg_edges::RefineParams::default`].
     pub(crate) refine_params: snapseg_edges::RefineParams,
+    /// Model to auto-load on the first frame after construction.
+    /// Cleared after the first `tick_pending_autoload` call. Kept on
+    /// `SnapsegApp` rather than `with_config`'s scope so the
+    /// auto-load runs inside the egui event loop (where `ctx` exists
+    /// for texture uploads).
+    pub(crate) pending_autoload: Option<crate::config::ModelConfig>,
 }
 
 impl Default for SnapsegApp {
@@ -112,7 +118,26 @@ impl Default for SnapsegApp {
             refine_edges: false,
             refined_polygon: None,
             refine_params: snapseg_edges::RefineParams::default(),
+            pending_autoload: None,
         }
+    }
+}
+
+impl SnapsegApp {
+    /// Build from a loaded operator config. Applies overrides from the
+    /// config to the default-constructed app and schedules a deferred
+    /// auto-load of `default_model` on the first frame (see
+    /// [`SnapsegApp::tick_pending_autoload`]).
+    pub fn with_config(cfg: crate::config::AppConfig) -> Self {
+        let mut app = Self::default();
+        if let Some(dir) = cfg.label_dir {
+            app.label_dir = snapseg_labels::LabelDir::new(dir);
+        }
+        if let Some(refine) = cfg.refine_edges {
+            app.refine_edges = refine;
+        }
+        app.pending_autoload = cfg.default_model;
+        app
     }
 }
 
@@ -125,6 +150,8 @@ pub(crate) struct LoadedImage {
 
 impl eframe::App for SnapsegApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.tick_pending_autoload(ctx);
+
         egui::SidePanel::right("controls")
             .default_width(280.0)
             .show(ctx, |ui| self.draw_controls(ui, ctx));

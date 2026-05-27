@@ -5,6 +5,7 @@
 //!
 //! - [`crate::app`]      — top-level `eframe::App` state + update wiring
 //! - [`crate::canvas`]   — image canvas drawing, click capture
+//! - [`crate::config`]   — project-local `snapseg.toml` operator config
 //! - [`crate::panel`]    — right-side controls + bottom status bar
 //! - [`crate::dialogs`]  — file dialogs for image + model load
 //! - [`crate::inference`] — synchronous encoder/decoder calls
@@ -13,6 +14,7 @@
 
 mod app;
 mod canvas;
+mod config;
 mod coords;
 mod dialogs;
 mod inference;
@@ -32,6 +34,21 @@ fn main() -> eframe::Result<()> {
         )
         .init();
 
+    let app = match crate::config::AppConfig::load_default() {
+        Ok(Some(cfg)) => {
+            tracing::info!("loaded snapseg.toml");
+            SnapsegApp::with_config(cfg)
+        }
+        Ok(None) => {
+            tracing::debug!("no snapseg.toml; using built-in defaults");
+            SnapsegApp::default()
+        }
+        Err(e) => {
+            tracing::error!("failed to load snapseg.toml: {e}");
+            SnapsegApp::default()
+        }
+    };
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
@@ -40,9 +57,5 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
-        "snapseg",
-        options,
-        Box::new(|_cc| Ok(Box::new(SnapsegApp::default()))),
-    )
+    eframe::run_native("snapseg", options, Box::new(|_cc| Ok(Box::new(app))))
 }

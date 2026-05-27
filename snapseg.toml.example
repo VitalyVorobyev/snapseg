@@ -1,0 +1,22 @@
+# snapseg.toml — operator-local configuration. Copy to ./snapseg.toml
+# and edit. The real file is gitignored.
+
+# Where labels get saved when you click "Save label". Relative paths are
+# resolved from the process cwd.
+label_dir    = "./labels"
+
+# Whether the subpixel-edge refinement toggle starts on.
+refine_edges = true
+
+# Auto-load this model on startup. Comment out to fall back to the
+# "Load MobileSAM…" file picker every launch.
+[default_model]
+name       = "mobile-sam"
+family     = "mobile_sam"
+input_size = 1024
+
+# Per-part local ONNX paths. For MobileSAM: encoder + decoder. For
+# single-network families (ritm, focalclick): a single `model` key.
+[default_model.parts]
+encoder = "assets/mobile_sam_20230629/mobile_sam.encoder.onnx"
+decoder = "assets/mobile_sam_20230629/sam_vit_h_4b8939.decoder.onnx"
