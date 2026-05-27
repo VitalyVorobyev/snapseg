@@ -1,0 +1,24 @@
+[package]
+name = "snapseg-labels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "snapseg label format: on-disk schema, provenance, and dataset export for the data flywheel."
+
+[[bin]]
+name = "snapseg-labels"
+path = "src/main.rs"
+
+[dependencies]
+snapseg-core.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+sha2.workspace = true
+ndarray.workspace = true
+image.workspace = true
+chrono.workspace = true

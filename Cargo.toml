@@ -6,6 +6,7 @@ members = [
     "crates/snapseg-models",
     "crates/snapseg-registry",
     "crates/snapseg-edges",
+    "crates/snapseg-labels",
     "crates/snapseg-app",
 ]
 
@@ -23,6 +24,7 @@ snapseg-runtime = { path = "crates/snapseg-runtime", version = "0.1.0" }
 snapseg-models = { path = "crates/snapseg-models", version = "0.1.0" }
 snapseg-registry = { path = "crates/snapseg-registry", version = "0.1.0" }
 snapseg-edges = { path = "crates/snapseg-edges", version = "0.1.0" }
+snapseg-labels = { path = "crates/snapseg-labels", version = "0.1.0" }
 
 anyhow = "1"
 thiserror = "2"
@@ -35,6 +37,7 @@ log = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 directories = "5"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 
