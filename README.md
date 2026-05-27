@@ -69,6 +69,9 @@ In the app:
 
 1. **Open image…** — load a grayscale (or color; it gets converted) industrial photo.
 2. **Load MobileSAM…** — pick the encoder `.onnx`, then the decoder `.onnx`. The encoder runs once per image (~1–2 s on CPU); subsequent decoder calls are fast.
+
+   The current default `models.toml` ships with empty URLs for MobileSAM — you bring the ONNX files yourself (see the [MobileSAM repo](https://github.com/ChaoningZhang/MobileSAM) for export instructions; a 1024×1024-input encoder + canonical SAM-ViT-H decoder pair is the standard combo). A real auto-download path lands when a blessed export is published.
+
 3. **Click** on the part you want segmented. Right-click for negative clicks (background hints).
 4. The translucent blue overlay is the predicted mask. **Last segment: NN ms** in the side panel tells you the decoder latency.
 

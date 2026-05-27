@@ -93,6 +93,13 @@ pub fn resolve(
     for part in &entry.parts {
         let dest = cache_dir.join(format!("{}--{}.onnx", entry.name, part.name));
         if !(dest.exists() && verify_sha256(&dest, &part.sha256)?) {
+            // Empty URL = "manual install"; never attempt to fetch.
+            if part.url.is_empty() {
+                return Err(RegistryError::Missing {
+                    name: format!("{}/{}", entry.name, part.name),
+                    path: dest,
+                });
+            }
             #[cfg(feature = "download")]
             {
                 download(&part.url, &dest)?;

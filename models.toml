@@ -13,17 +13,17 @@ name = "mobile-sam"
 family = "mobile_sam"
 input_size = [1024, 1024]
 license = "Apache-2.0"
-notes = "Distilled SAM with TinyViT encoder. Click + box prompts."
+notes = "Distilled SAM with TinyViT encoder. Click + box prompts. manual install — see README"
 
 [[model.parts]]
 name = "encoder"
-url = "https://huggingface.co/snapseg/onnx/resolve/main/mobile_sam_encoder.onnx"
+url = ""
 sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 size_mb = 27
 
 [[model.parts]]
 name = "decoder"
-url = "https://huggingface.co/snapseg/onnx/resolve/main/mobile_sam_decoder.onnx"
+url = ""
 sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 size_mb = 16
 
@@ -32,11 +32,11 @@ name = "ritm-hrnet18-cocolvis"
 family = "ritm"
 input_size = [1024, 1024]
 license = "MIT"
-notes = "RITM HRNet-18 on COCO+LVIS. Click-driven; one network call per click."
+notes = "RITM HRNet-18 on COCO+LVIS. Click-driven; one network call per click. manual install — see README"
 
 [[model.parts]]
 name = "model"
-url = "https://example.invalid/ritm-hrnet18-cocolvis.onnx"
+url = ""
 sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 size_mb = 41
 
@@ -45,10 +45,10 @@ name = "focalclick-hrnet18s2"
 family = "focalclick"
 input_size = [1024, 1024]
 license = "MIT"
-notes = "FocalClick HRNet18-S2. Local-crop refinement keeps subsequent clicks cheap on CPU."
+notes = "FocalClick HRNet18-S2. Local-crop refinement keeps subsequent clicks cheap on CPU. manual install — see README"
 
 [[model.parts]]
 name = "model"
-url = "https://example.invalid/focalclick-hrnet18s2.onnx"
+url = ""
 sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 size_mb = 39
