@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ '*' ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: fmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: check
+        run: cargo check --workspace --all-targets
+
+      - name: test
+        # ort uses load-dynamic — sessions cannot actually open without
+        # onnxruntime on the runner. Library code that *uses* ort is
+        # tested via #[ignore]-d integration tests today; pure unit
+        # tests run unconditionally.
+        run: cargo test --workspace
+
+      - name: docs
+        # The bar is zero missing-docs warnings on public items.
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps
