@@ -83,6 +83,12 @@ pub(crate) fn save_current_label(app: &mut SnapsegApp) -> Result<Label, LabelErr
     let prompts = prompts_to_json(&app.session, &app.prompt_t_ms)?;
     let inputs = build_provenance_inputs(app);
     let logits = app.last_logits.as_ref();
+    let polygon = if app.refine_edges {
+        app.refined_polygon.as_ref().map(to_polygon_json)
+    } else {
+        None
+    };
+    let polygon_ref = polygon.as_ref();
 
     app.label_dir.save(
         Some(image.path.as_path()),
@@ -90,7 +96,19 @@ pub(crate) fn save_current_label(app: &mut SnapsegApp) -> Result<Label, LabelErr
         prompts,
         mask,
         logits,
-        None, // polygon — wired in M3-T05
+        polygon_ref,
         inputs,
     )
+}
+
+/// Translate a [`snapseg_edges::RefinedPolygon`] into the on-disk
+/// [`snapseg_labels::PolygonJson`] shape. Stamps the current
+/// [`snapseg_labels::SCHEMA_VERSION`] so the saved file is
+/// self-describing.
+fn to_polygon_json(rp: &snapseg_edges::RefinedPolygon) -> snapseg_labels::PolygonJson {
+    snapseg_labels::PolygonJson {
+        schema_version: snapseg_labels::SCHEMA_VERSION.to_string(),
+        vertices: rp.vertices.iter().map(|p| [p.x, p.y]).collect(),
+        confidence: rp.confidence.clone(),
+    }
 }

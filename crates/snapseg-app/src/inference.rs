@@ -22,6 +22,7 @@ impl SnapsegApp {
         // previous one.
         self.last_mask = None;
         self.last_logits = None;
+        self.refined_polygon = None;
         self.first_prompt_at = None;
         self.prompt_t_ms.clear();
 
@@ -58,14 +59,28 @@ impl SnapsegApp {
         if self.session.is_empty() {
             self.mask_texture = None;
             self.last_inference_ms = None;
+            self.refined_polygon = None;
             return;
         }
         match seg.segment(&self.session) {
             Ok(res) => {
                 self.last_inference_ms = Some(res.inference_time.as_millis() as u64);
                 self.mask_texture = Some(mask_to_texture(ctx, &res.mask));
-                self.last_mask = Some(res.mask.clone());
-                self.last_logits = Some(res.logits.clone());
+                if self.refine_edges {
+                    if let Some(img) = self.image.as_ref() {
+                        self.refined_polygon = Some(snapseg_edges::refine_polygon(
+                            &res.mask,
+                            &img.gray,
+                            self.refine_params,
+                        ));
+                    } else {
+                        self.refined_polygon = None;
+                    }
+                } else {
+                    self.refined_polygon = None;
+                }
+                self.last_mask = Some(res.mask);
+                self.last_logits = Some(res.logits);
                 self.error = None;
             }
             Err(e) => {
@@ -73,7 +88,21 @@ impl SnapsegApp {
                 self.error = Some(format!("segment: {e}"));
                 self.last_mask = None;
                 self.last_logits = None;
+                self.refined_polygon = None;
             }
         }
+    }
+
+    /// Run the subpixel refinement once against the latest cached mask.
+    /// No-op when there's no mask or no image.
+    pub(crate) fn refine_now(&mut self) {
+        let (Some(mask), Some(img)) = (self.last_mask.as_ref(), self.image.as_ref()) else {
+            return;
+        };
+        self.refined_polygon = Some(snapseg_edges::refine_polygon(
+            mask,
+            &img.gray,
+            self.refine_params,
+        ));
     }
 }

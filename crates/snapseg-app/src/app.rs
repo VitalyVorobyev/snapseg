@@ -73,6 +73,15 @@ pub struct SnapsegApp {
     /// Free-form note the operator will attach to the next saved label.
     /// Cleared after each successful save.
     pub(crate) pending_note: String,
+    /// Whether to run `snapseg_edges::refine_polygon` after every successful
+    /// `segment()` call. The operator can toggle this from the side panel.
+    pub(crate) refine_edges: bool,
+    /// Per-vertex subpixel refinement of the latest mask, if
+    /// `refine_edges` is on and the last segment succeeded.
+    pub(crate) refined_polygon: Option<snapseg_edges::RefinedPolygon>,
+    /// Knobs for the refinement pass. Defaults from
+    /// [`snapseg_edges::RefineParams::default`].
+    pub(crate) refine_params: snapseg_edges::RefineParams,
 }
 
 impl Default for SnapsegApp {
@@ -100,6 +109,9 @@ impl Default for SnapsegApp {
             last_save_status: None,
             pending_quality: snapseg_labels::LabelQuality::Good,
             pending_note: String::new(),
+            refine_edges: false,
+            refined_polygon: None,
+            refine_params: snapseg_edges::RefineParams::default(),
         }
     }
 }

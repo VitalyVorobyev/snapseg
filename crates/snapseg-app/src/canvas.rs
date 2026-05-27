@@ -7,7 +7,7 @@
 //! and the texture builders in [`crate::textures`].
 
 use eframe::egui;
-use snapseg_core::{Polarity, Prompt};
+use snapseg_core::{Point2, Polarity, Prompt};
 
 use crate::app::SnapsegApp;
 use crate::coords::{fit_rect, image_to_screen, opposite, screen_to_image};
@@ -32,6 +32,9 @@ impl SnapsegApp {
         }
 
         let clicked = capture_click(self, &response, display_rect, img_size);
+        if let Some(polygon) = &self.refined_polygon {
+            paint_polygon(&painter, &polygon.vertices, display_rect, img_size);
+        }
         paint_prompts(&painter, &self.session.prompts, display_rect, img_size);
 
         if clicked {
@@ -85,6 +88,26 @@ fn capture_click(
         polarity,
     });
     true
+}
+
+fn paint_polygon(
+    painter: &egui::Painter,
+    vertices: &[Point2],
+    display_rect: egui::Rect,
+    img_size: egui::Vec2,
+) {
+    if vertices.len() < 2 {
+        return;
+    }
+    let stroke = egui::Stroke::new(
+        1.5,
+        egui::Color32::from_rgba_premultiplied(255, 215, 0, 220),
+    );
+    for i in 0..vertices.len() {
+        let a = image_to_screen(vertices[i], display_rect, img_size);
+        let b = image_to_screen(vertices[(i + 1) % vertices.len()], display_rect, img_size);
+        painter.line_segment([a, b], stroke);
+    }
 }
 
 fn paint_prompts(

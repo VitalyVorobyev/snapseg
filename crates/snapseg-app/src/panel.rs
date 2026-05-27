@@ -47,6 +47,7 @@ impl SnapsegApp {
             self.last_inference_ms = None;
             self.last_mask = None;
             self.last_logits = None;
+            self.refined_polygon = None;
         }
 
         ui.add_space(8.0);
@@ -119,6 +120,26 @@ impl SnapsegApp {
             Some(s) => ui.label(format!("Last save: {s}")),
             None => ui.label("Last save: (none yet)"),
         };
+
+        ui.add_space(8.0);
+        ui.separator();
+        let prev_refine = self.refine_edges;
+        ui.checkbox(&mut self.refine_edges, "Refine subpixel edges");
+        let edge_on = !prev_refine && self.refine_edges;
+        let edge_off = prev_refine && !self.refine_edges;
+        if edge_on {
+            self.refine_now();
+        }
+        if edge_off {
+            self.refined_polygon = None;
+        }
+        if self.refine_edges {
+            if let Some(p) = &self.refined_polygon {
+                ui.label(format!("Polygon: {} vertices", p.vertices.len()));
+            } else {
+                ui.label("Polygon: (pending next segment)");
+            }
+        }
 
         if let Some(ms) = self.last_inference_ms {
             ui.add_space(8.0);
