@@ -14,6 +14,14 @@
 //! out  *first output*     : float32 [1, 256, S/16, S/16]    image embedding
 //! ```
 //!
+//! The adapter also tolerates three common community-export variants
+//! by introspecting the session's declared input shape: unbatched
+//! CHW `[3, S, S]`, batched channels-last NHWC `[1, S, S, 3]`, and
+//! unbatched HWC `[S, S, 3]` (the layout produced by some of the
+//! 2023 MobileSAM exports). The output is unsqueezed back to 4-D
+//! when the encoder dropped the batch dim, so downstream code can
+//! keep assuming `[1, 256, h, w]`.
+//!
 //! Decoder:
 //! ```text
 //! in   `image_embeddings` : float32 [1, 256, h, w]
@@ -205,13 +213,75 @@ impl InteractiveSegmenter for MobileSamSegmenter {
 
 /// Run the encoder and reshape its first 4-D output into the cached
 /// `[1, 256, S/16, S/16]` embedding tensor.
+///
+/// Handles four common export variants of the MobileSAM encoder by
+/// introspecting the session's declared input shape:
+///
+/// - canonical batched NCHW: `[1, 3, S, S]`
+/// - unbatched CHW:          `[3, S, S]`
+/// - batched NHWC:           `[1, S, S, 3]`
+/// - unbatched HWC:          `[S, S, 3]`
+///
+/// The input arrives here as NCHW; we permute / squeeze as needed
+/// based on the rank and the position of the channels-3 dim. The
+/// output is unsqueezed back to 4-D `[1, 256, h, w]` for the cache
+/// regardless of which variant the encoder used.
 fn run_encoder(encoder: &mut Backend, input: Array4<f32>) -> Result<Array4<f32>, SegError> {
-    let v_input = ort::value::Value::from_array(input)
-        .map_err(|e| SegError::Backend(format!("encoder input value: {e}")))?;
-    let outputs = encoder
+    // Capture expected shape as owned ints so the borrow on session
+    // metadata ends before we call session_mut().run() below.
+    let expected_shape: Vec<i64> = encoder
         .session_mut()
-        .run(ort::inputs!["input_image" => v_input])
-        .map_err(|e| SegError::Backend(format!("encoder run: {e}")))?;
+        .inputs
+        .first()
+        .and_then(|i| i.input_type.tensor_shape())
+        .map(|s| s.iter().copied().collect())
+        .unwrap_or_default();
+    tracing::debug!(shape = ?expected_shape, "encoder input shape");
+
+    let layout = classify_encoder_layout(&expected_shape);
+    let outputs = match layout {
+        EncoderLayout::Nchw => {
+            let v = ort::value::Value::from_array(input)
+                .map_err(|e| SegError::Backend(format!("encoder input value: {e}")))?;
+            encoder
+                .session_mut()
+                .run(ort::inputs!["input_image" => v])
+                .map_err(|e| SegError::Backend(format!("encoder run: {e}")))?
+        }
+        EncoderLayout::Chw => {
+            let chw: Array3<f32> = input.index_axis_move(ndarray::Axis(0), 0);
+            let v = ort::value::Value::from_array(chw)
+                .map_err(|e| SegError::Backend(format!("encoder input value: {e}")))?;
+            encoder
+                .session_mut()
+                .run(ort::inputs!["input_image" => v])
+                .map_err(|e| SegError::Backend(format!("encoder run: {e}")))?
+        }
+        EncoderLayout::Nhwc => {
+            // NCHW [N, 3, H, W] -> NHWC [N, H, W, 3] then materialise
+            // a contiguous buffer (permuted_axes returns a view with
+            // rearranged strides; ort wants a standard-layout array).
+            let nhwc = input.permuted_axes([0, 2, 3, 1]);
+            let nhwc = nhwc.as_standard_layout().to_owned();
+            let v = ort::value::Value::from_array(nhwc)
+                .map_err(|e| SegError::Backend(format!("encoder input value: {e}")))?;
+            encoder
+                .session_mut()
+                .run(ort::inputs!["input_image" => v])
+                .map_err(|e| SegError::Backend(format!("encoder run: {e}")))?
+        }
+        EncoderLayout::Hwc => {
+            let chw: Array3<f32> = input.index_axis_move(ndarray::Axis(0), 0);
+            let hwc = chw.permuted_axes([1, 2, 0]);
+            let hwc = hwc.as_standard_layout().to_owned();
+            let v = ort::value::Value::from_array(hwc)
+                .map_err(|e| SegError::Backend(format!("encoder input value: {e}")))?;
+            encoder
+                .session_mut()
+                .run(ort::inputs!["input_image" => v])
+                .map_err(|e| SegError::Backend(format!("encoder run: {e}")))?
+        }
+    };
 
     // Pick the first output whose name contains "embedding", else fall
     // back to the first output regardless of name.
@@ -245,13 +315,51 @@ fn run_encoder(encoder: &mut Backend, input: Array4<f32>) -> Result<Array4<f32>,
 
     let (shape, data) =
         pick.ok_or_else(|| SegError::Backend("encoder returned no outputs".into()))?;
-    if shape.len() != 4 {
-        return Err(SegError::Backend(format!(
-            "expected 4-D embedding, got shape {shape:?}"
-        )));
-    }
-    Array4::from_shape_vec((shape[0], shape[1], shape[2], shape[3]), data)
+    tracing::debug!(shape = ?shape, "encoder output shape");
+    // Unbatched encoder exports return `[256, S/16, S/16]`; prepend
+    // an implicit batch-1 dim so the rest of the adapter can keep
+    // assuming 4-D `[1, 256, h, w]`.
+    let (n, c, h, w) = match shape.len() {
+        4 => (shape[0], shape[1], shape[2], shape[3]),
+        3 => (1, shape[0], shape[1], shape[2]),
+        _ => {
+            return Err(SegError::Backend(format!(
+                "expected 3-D or 4-D embedding, got shape {shape:?}"
+            )));
+        }
+    };
+    Array4::from_shape_vec((n, c, h, w), data)
         .map_err(|e| SegError::Backend(format!("embedding reshape: {e}")))
+}
+
+/// Memory layout the encoder expects, inferred from the session's
+/// declared input shape. Channels-3 position tells channels-first vs
+/// channels-last; presence of the leading batch dim distinguishes
+/// batched from unbatched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncoderLayout {
+    /// `[1, 3, S, S]` — canonical SAM / MobileSAM export.
+    Nchw,
+    /// `[3, S, S]` — community CHW export, no batch dim.
+    Chw,
+    /// `[1, S, S, 3]` — channels-last with batch.
+    Nhwc,
+    /// `[S, S, 3]` — channels-last, no batch.
+    Hwc,
+}
+
+/// Decide the encoder layout from the session's declared input shape.
+/// Defaults to `Nchw` when the shape is empty or ambiguous (the
+/// adapter's historical assumption, which matches the canonical
+/// export).
+fn classify_encoder_layout(shape: &[i64]) -> EncoderLayout {
+    match shape.len() {
+        4 if shape[3] == 3 => EncoderLayout::Nhwc,
+        4 => EncoderLayout::Nchw,
+        3 if shape[2] == 3 => EncoderLayout::Hwc,
+        3 => EncoderLayout::Chw,
+        _ => EncoderLayout::Nchw,
+    }
 }
 
 /// Build the SAM `point_coords` / `point_labels` tensors from a prompt
@@ -389,4 +497,54 @@ fn into_dyn_value<D: ndarray::Dimension>(
     ort::value::Value::from_array(arr.into_dyn())
         .map_err(|e| SegError::Backend(format!("{what} value: {e}")))
         .map(|v| v.into_dyn())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layout_canonical_nchw() {
+        assert_eq!(
+            classify_encoder_layout(&[1, 3, 1024, 1024]),
+            EncoderLayout::Nchw
+        );
+        // Dynamic spatial dims still resolve to NCHW (channels-3 at index 1).
+        assert_eq!(
+            classify_encoder_layout(&[-1, 3, -1, -1]),
+            EncoderLayout::Nchw
+        );
+    }
+
+    #[test]
+    fn layout_chw_no_batch() {
+        assert_eq!(
+            classify_encoder_layout(&[3, 1024, 1024]),
+            EncoderLayout::Chw
+        );
+    }
+
+    #[test]
+    fn layout_nhwc_channels_last_batched() {
+        assert_eq!(
+            classify_encoder_layout(&[1, 1024, 1024, 3]),
+            EncoderLayout::Nhwc
+        );
+    }
+
+    #[test]
+    fn layout_hwc_no_batch() {
+        // The variant produced by the 2023-06-29 MobileSAM export the
+        // smoke test exercises: `[-1, -1, 3]`.
+        assert_eq!(classify_encoder_layout(&[-1, -1, 3]), EncoderLayout::Hwc);
+        assert_eq!(
+            classify_encoder_layout(&[1024, 1024, 3]),
+            EncoderLayout::Hwc
+        );
+    }
+
+    #[test]
+    fn layout_empty_defaults_to_nchw() {
+        assert_eq!(classify_encoder_layout(&[]), EncoderLayout::Nchw);
+    }
 }

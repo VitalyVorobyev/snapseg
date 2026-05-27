@@ -83,21 +83,60 @@ pub enum ConfigError {
     Toml(#[from] toml::de::Error),
 }
 
+/// A config plus the file it was loaded from. The source path lets
+/// callers resolve config-relative paths (model parts, onnxruntime_path)
+/// against the directory the config file lives in — more intuitive than
+/// resolving against cwd, and robust to `cargo run -p` setting cwd to
+/// the package directory rather than the workspace root.
+#[derive(Debug, Clone)]
+pub struct LoadedConfig {
+    /// Parsed config.
+    pub config: AppConfig,
+    /// Absolute path the config was loaded from.
+    pub source: PathBuf,
+}
+
+impl LoadedConfig {
+    /// Directory containing the config file. Used as the base for
+    /// resolving any relative paths inside the config.
+    pub fn dir(&self) -> &Path {
+        self.source.parent().unwrap_or(Path::new("."))
+    }
+
+    /// Resolve a path against [`LoadedConfig::dir`] if relative; return
+    /// the path as-is if already absolute.
+    pub fn resolve(&self, p: &Path) -> PathBuf {
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.dir().join(p)
+        }
+    }
+}
+
 impl AppConfig {
-    /// Load `./snapseg.toml` from cwd. Returns `Ok(None)` when the file
-    /// is absent (a no-op startup); `Err` only on read or parse failure.
+    /// Find `snapseg.toml` by walking up from cwd, then load it.
+    /// Returns `Ok(None)` when no config exists anywhere up the chain;
+    /// `Err` only on read or parse failure.
+    ///
+    /// Walking up handles `cargo run -p <pkg>` setting cwd to the
+    /// package directory: from `crates/snapseg-app/` we walk to
+    /// `crates/`, then to the workspace root where `snapseg.toml`
+    /// lives.
     ///
     /// # Errors
     ///
     /// Returns [`ConfigError::Io`] on any I/O failure other than
     /// file-not-found, or [`ConfigError::Toml`] on a parse error.
-    pub fn load_default() -> Result<Option<Self>, ConfigError> {
-        let path = PathBuf::from(DEFAULT_CONFIG_NAME);
-        match Self::load_from(&path) {
-            Ok(cfg) => Ok(Some(cfg)),
-            Err(ConfigError::NotFound(_)) => Ok(None),
-            Err(e) => Err(e),
-        }
+    pub fn load_default() -> Result<Option<LoadedConfig>, ConfigError> {
+        let Some(path) = find_config_upward()? else {
+            return Ok(None);
+        };
+        let config = Self::load_from(&path)?;
+        Ok(Some(LoadedConfig {
+            config,
+            source: path,
+        }))
     }
 
     /// Load from an explicit path.
@@ -117,6 +156,21 @@ impl AppConfig {
         })?;
         let cfg: Self = toml::from_str(&text)?;
         Ok(cfg)
+    }
+}
+
+/// Walk up from cwd looking for `snapseg.toml`. Returns the first hit
+/// or `None` if none exists between cwd and the filesystem root.
+fn find_config_upward() -> Result<Option<PathBuf>, ConfigError> {
+    let mut dir = std::env::current_dir()?;
+    loop {
+        let candidate = dir.join(DEFAULT_CONFIG_NAME);
+        if candidate.is_file() {
+            return Ok(Some(candidate));
+        }
+        if !dir.pop() {
+            return Ok(None);
+        }
     }
 }
 

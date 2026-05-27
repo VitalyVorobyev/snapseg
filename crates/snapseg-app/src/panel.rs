@@ -157,20 +157,40 @@ impl SnapsegApp {
     /// (`label_dir`, `refine_edges`) take effect immediately.
     pub(crate) fn reload_config(&mut self) {
         match crate::config::AppConfig::load_default() {
-            Ok(Some(cfg)) => {
-                if let Some(dir) = cfg.label_dir {
-                    self.label_dir = snapseg_labels::LabelDir::new(dir);
+            Ok(Some(loaded)) => {
+                // Mirror main.rs: resolve relative paths against the
+                // config file's directory so the same snapseg.toml
+                // works regardless of where the user is when they
+                // click Reload.
+                if let Some(p) = loaded.config.onnxruntime_path.as_ref() {
+                    // Re-setting ORT_DYLIB_PATH after the first ort
+                    // session is created has no effect (the dylib is
+                    // already dlopen'd into a OnceLock). Log so the
+                    // operator knows a restart is needed if they
+                    // changed it.
+                    let abs = loaded.resolve(p);
+                    tracing::warn!(
+                        path = %abs.display(),
+                        "onnxruntime_path changed; restart required to take effect"
+                    );
                 }
-                if let Some(refine) = cfg.refine_edges {
+                if let Some(dir) = loaded.config.label_dir.as_ref() {
+                    self.label_dir = snapseg_labels::LabelDir::new(loaded.resolve(dir));
+                }
+                if let Some(refine) = loaded.config.refine_edges {
                     self.refine_edges = refine;
                 }
-                if let Some(model) = cfg.default_model {
+                if let Some(mut model) = loaded.config.default_model.clone() {
+                    for (_part, path) in model.parts.iter_mut() {
+                        *path = loaded.resolve(path);
+                    }
                     self.pending_autoload = Some(model);
                 }
-                self.last_save_status = Some("Config reloaded".into());
+                self.last_save_status =
+                    Some(format!("Config reloaded from {}", loaded.source.display()));
             }
             Ok(None) => {
-                self.last_save_status = Some("No snapseg.toml in cwd".into());
+                self.last_save_status = Some("No snapseg.toml found walking up from cwd".into());
             }
             Err(e) => {
                 self.error = Some(format!("Config load failed: {e}"));
