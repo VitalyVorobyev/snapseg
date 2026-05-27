@@ -17,6 +17,8 @@
 //! [`SCHEMA_VERSION`] (`"1.0"`). Older labels must remain readable for
 //! the foreseeable future; bump only for breaking changes.
 
+pub mod coco;
+
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -586,6 +588,19 @@ pub enum LabelError {
     /// mask and image dimensions).
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// Mask file format is broken — wrong dimensions, missing, or could
+    /// not decode.
+    #[error("mask format: {0}")]
+    MaskFormat(String),
+    /// Label directory was missing a required file (image.png, mask.png,
+    /// meta.toml).
+    #[error("missing artifact `{artifact}` in label `{label}`")]
+    MissingArtifact {
+        /// Label id (the directory name).
+        label: String,
+        /// Name of the required artifact that was not found.
+        artifact: &'static str,
+    },
 }
 
 #[cfg(test)]

@@ -1,0 +1,662 @@
+//! COCO-shaped export of snapseg labels.
+//!
+//! Maps each `labels/<id>/` directory to one COCO image + one COCO
+//! annotation. Binary masks are encoded as **uncompressed COCO RLE**
+//! (`counts` as a `Vec<u32>` of alternating background/foreground
+//! run-lengths walked column-major, starting with the background run).
+//! Polygon segmentations and compressed RLE land when subpixel edges
+//! (M3) do.
+//!
+//! The current export emits a single category — `id = 1`, name
+//! `"foreground"` — because snapseg labels are binary (one
+//! foreground region per label) per [`AGENTS.md`]. Multi-class
+//! semantic segmentation is an explicit non-goal.
+//!
+//! [`AGENTS.md`]: ../../AGENTS.md
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::{LabelError, LabelQuality, Provenance, SCHEMA_VERSION};
+
+/// Options controlling the conversion.
+#[derive(Debug, Clone)]
+pub struct ConvertOptions {
+    /// Drop labels whose `operator.quality == Reject` from the export.
+    /// Defaults to `true`; the rejected-as-good label is more harmful
+    /// than the dropped-good-label is.
+    pub skip_rejected: bool,
+}
+
+impl Default for ConvertOptions {
+    fn default() -> Self {
+        Self {
+            skip_rejected: true,
+        }
+    }
+}
+
+/// Top-level COCO dataset. Matches the canonical
+/// `info` / `images` / `annotations` / `categories` shape.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CocoDataset {
+    /// Dataset-level metadata.
+    pub info: CocoInfo,
+    /// One [`CocoImage`] per included label.
+    pub images: Vec<CocoImage>,
+    /// One [`CocoAnnotation`] per included label (1:1 with images).
+    pub annotations: Vec<CocoAnnotation>,
+    /// Always a single-entry foreground category in this version.
+    pub categories: Vec<CocoCategory>,
+}
+
+/// Dataset-level metadata.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CocoInfo {
+    /// Human-readable dataset description.
+    pub description: String,
+    /// Dataset version string. Snapseg writes `"1.0"` today; bump as
+    /// downstream consumers diverge.
+    pub version: String,
+    /// On-disk schema version of the labels this dataset was rolled
+    /// from. Matches [`crate::SCHEMA_VERSION`].
+    pub schema_version: String,
+    /// Calendar year, taken from the system clock at export time.
+    pub year: u32,
+}
+
+/// One COCO image entry. Corresponds to one snapseg label directory.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CocoImage {
+    /// Monotonically increasing identifier, 1-based.
+    pub id: u64,
+    /// Image width in pixels.
+    pub width: u32,
+    /// Image height in pixels.
+    pub height: u32,
+    /// Path relative to the labels/ root, e.g. `"abc12345/image.png"`.
+    pub file_name: String,
+    /// RFC3339 timestamp from the label's `meta.toml`.
+    pub date_captured: String,
+    /// Human-readable note: `"<registry_name> · <quality> · <commit?>"`.
+    pub note: String,
+    /// Full snapseg [`Provenance`] for downstream filtering by family,
+    /// runtime, operator quality, commit, …
+    pub snapseg_provenance: Provenance,
+}
+
+/// One COCO annotation entry. snapseg writes one annotation per image.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CocoAnnotation {
+    /// Monotonically increasing identifier, 1-based.
+    pub id: u64,
+    /// Owning [`CocoImage::id`].
+    pub image_id: u64,
+    /// Always `1` (foreground); see module docs.
+    pub category_id: u32,
+    /// `[x, y, w, h]` of the mask's tight axis-aligned bounding box.
+    pub bbox: [f64; 4],
+    /// Foreground pixel count.
+    pub area: f64,
+    /// Mask segmentation; uncompressed RLE today.
+    pub segmentation: CocoSegmentation,
+    /// Always `0`; snapseg labels are single-instance.
+    pub iscrowd: u32,
+}
+
+/// Mask payload for [`CocoAnnotation::segmentation`].
+///
+/// Only uncompressed RLE today; polygon and compressed RLE land with
+/// subpixel edges in M3.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CocoSegmentation {
+    /// Uncompressed column-major RLE.
+    UncompressedRle {
+        /// Alternating background/foreground run-lengths starting from
+        /// background. Walked column-major. If the first pixel is
+        /// foreground, the first entry is a leading zero.
+        counts: Vec<u32>,
+        /// `[height, width]` of the mask.
+        size: [u32; 2],
+    },
+}
+
+/// One COCO category. snapseg emits exactly one — `id = 1`, name
+/// `"foreground"` — because snapseg labels are binary.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CocoCategory {
+    /// Category id; always `1` in this version.
+    pub id: u32,
+    /// Human-readable category name.
+    pub name: String,
+    /// Parent category name; `"snapseg"`.
+    pub supercategory: String,
+}
+
+/// Convert every label directory under `label_root` into a
+/// [`CocoDataset`].
+///
+/// Iteration is sorted by directory name so the output is
+/// deterministic across runs. Directory entries whose name ends with
+/// `.partial` are skipped (these are in-progress writes by
+/// [`crate::LabelDir::save`]).
+///
+/// `image_id` and `annotation_id` start at `1` and increment in
+/// lockstep — one image per annotation for now.
+///
+/// # Errors
+///
+/// - [`LabelError::Io`] if `label_root` cannot be read or a label
+///   directory cannot be opened.
+/// - [`LabelError::TomlDe`] / [`LabelError::Json`] /
+///   [`LabelError::Image`] when an individual label's `meta.toml`,
+///   `prompts.json`, or `mask.png` is corrupt.
+/// - [`LabelError::MissingArtifact`] when a per-label file is absent.
+/// - [`LabelError::MaskFormat`] when a mask's dimensions disagree with
+///   the source image's dimensions in `meta.toml`.
+pub fn convert_dir(label_root: &Path, opts: ConvertOptions) -> Result<CocoDataset, LabelError> {
+    let entries = sorted_label_dirs(label_root)?;
+
+    let mut images: Vec<CocoImage> = Vec::new();
+    let mut annotations: Vec<CocoAnnotation> = Vec::new();
+    let mut next_id: u64 = 1;
+
+    for dir in entries {
+        let meta = read_meta(&dir)?;
+        if opts.skip_rejected && matches!(meta.operator.quality, LabelQuality::Reject) {
+            continue;
+        }
+        let (image, annotation) = label_to_coco_entries(&dir, meta, next_id, next_id)?;
+        images.push(image);
+        annotations.push(annotation);
+        next_id += 1;
+    }
+
+    Ok(CocoDataset {
+        info: CocoInfo {
+            description: "snapseg labels exported to COCO".to_string(),
+            version: "1.0".to_string(),
+            schema_version: SCHEMA_VERSION.to_string(),
+            year: chrono::Utc::now()
+                .format("%Y")
+                .to_string()
+                .parse::<u32>()
+                .unwrap_or(0),
+        },
+        images,
+        annotations,
+        categories: vec![CocoCategory {
+            id: 1,
+            name: "foreground".to_string(),
+            supercategory: "snapseg".to_string(),
+        }],
+    })
+}
+
+/// Convert + write `label_root` to `out_path` as pretty JSON.
+///
+/// Returns the number of labels included in the dataset.
+///
+/// # Errors
+///
+/// Same set as [`convert_dir`], plus [`LabelError::Io`] /
+/// [`LabelError::Json`] for the output write.
+pub fn convert_dir_to_file(
+    label_root: &Path,
+    out_path: &Path,
+    opts: ConvertOptions,
+) -> Result<usize, LabelError> {
+    let ds = convert_dir(label_root, opts)?;
+    let json = serde_json::to_string_pretty(&ds)?;
+    fs::write(out_path, json)?;
+    Ok(ds.images.len())
+}
+
+/// List every plausible per-label subdirectory under `label_root`,
+/// sorted ascending by file name.
+///
+/// Skips files, `.partial` orphans (in-progress writes), and entries
+/// whose name starts with `.` (hidden dotfiles like `.DS_Store`).
+fn sorted_label_dirs(label_root: &Path) -> Result<Vec<PathBuf>, LabelError> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for entry in fs::read_dir(label_root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy().to_string();
+        if name.starts_with('.') || name.ends_with(".partial") {
+            continue;
+        }
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        dirs.push(path);
+    }
+    dirs.sort();
+    Ok(dirs)
+}
+
+/// Read and parse `<label_dir>/meta.toml`.
+fn read_meta(label_dir: &Path) -> Result<Provenance, LabelError> {
+    let meta_path = label_dir.join("meta.toml");
+    if !meta_path.exists() {
+        return Err(LabelError::MissingArtifact {
+            label: label_id_from_dir(label_dir),
+            artifact: "meta.toml",
+        });
+    }
+    let s = fs::read_to_string(&meta_path)?;
+    let prov: Provenance = toml::from_str(&s)?;
+    Ok(prov)
+}
+
+/// Build one image + one annotation from a single label directory.
+fn label_to_coco_entries(
+    label_dir: &Path,
+    meta: Provenance,
+    image_id: u64,
+    annotation_id: u64,
+) -> Result<(CocoImage, CocoAnnotation), LabelError> {
+    let id = label_id_from_dir(label_dir);
+
+    // image.png — present-check only; we don't need its bytes here.
+    let image_path = label_dir.join("image.png");
+    if !image_path.exists() {
+        return Err(LabelError::MissingArtifact {
+            label: id,
+            artifact: "image.png",
+        });
+    }
+
+    // mask.png — load, validate dimensions, encode RLE.
+    let mask_path = label_dir.join("mask.png");
+    if !mask_path.exists() {
+        return Err(LabelError::MissingArtifact {
+            label: id,
+            artifact: "mask.png",
+        });
+    }
+    let mask_img = image::open(&mask_path)?.to_luma8();
+    let mw = mask_img.width();
+    let mh = mask_img.height();
+    if mw != meta.source_image_width || mh != meta.source_image_height {
+        return Err(LabelError::MaskFormat(format!(
+            "mask {}x{} does not match source {}x{} in {}",
+            mw, mh, meta.source_image_width, meta.source_image_height, id,
+        )));
+    }
+    let raw = mask_img.into_raw();
+    let (bbox, area) = mask_bbox_and_area(&raw, mh as usize, mw as usize);
+    let counts = encode_rle(&raw, mh as usize, mw as usize);
+
+    let note = build_note(&meta);
+    let file_name = format!("{id}/image.png");
+
+    let image = CocoImage {
+        id: image_id,
+        width: meta.source_image_width,
+        height: meta.source_image_height,
+        file_name,
+        date_captured: meta.created_at.clone(),
+        note,
+        snapseg_provenance: meta,
+    };
+    let annotation = CocoAnnotation {
+        id: annotation_id,
+        image_id,
+        category_id: 1,
+        bbox,
+        area,
+        segmentation: CocoSegmentation::UncompressedRle {
+            counts,
+            size: [mh, mw],
+        },
+        iscrowd: 0,
+    };
+    Ok((image, annotation))
+}
+
+/// Encode a row-major u8 mask as uncompressed COCO RLE
+/// (column-major, alternating runs starting from background).
+///
+/// Pixels above 127 are foreground; everything else is background.
+/// If the very first pixel (col=0, row=0) is foreground, the first
+/// emitted run-length is a leading zero so the alternation invariant
+/// (run #0 = background, run #1 = foreground, …) holds.
+fn encode_rle(mask: &[u8], h: usize, w: usize) -> Vec<u32> {
+    let mut counts: Vec<u32> = Vec::new();
+    let mut current_val: u8 = 0;
+    let mut run: u32 = 0;
+    for col in 0..w {
+        for row in 0..h {
+            let v: u8 = if mask[row * w + col] > 127 { 1 } else { 0 };
+            if v == current_val {
+                run += 1;
+            } else {
+                counts.push(run);
+                current_val = 1 - current_val;
+                run = 1;
+            }
+        }
+    }
+    counts.push(run);
+    counts
+}
+
+/// Compute `[x, y, w, h]` bounding box (f64) and foreground pixel
+/// count for a row-major u8 mask. Returns `([0,0,0,0], 0.0)` when the
+/// mask is empty.
+fn mask_bbox_and_area(mask: &[u8], h: usize, w: usize) -> ([f64; 4], f64) {
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let mut area: u64 = 0;
+    for row in 0..h {
+        for col in 0..w {
+            if mask[row * w + col] > 127 {
+                area += 1;
+                let x = col as f64;
+                let y = row as f64;
+                if x < min_x {
+                    min_x = x;
+                }
+                if y < min_y {
+                    min_y = y;
+                }
+                if x > max_x {
+                    max_x = x;
+                }
+                if y > max_y {
+                    max_y = y;
+                }
+            }
+        }
+    }
+    if area == 0 {
+        return ([0.0, 0.0, 0.0, 0.0], 0.0);
+    }
+    (
+        [min_x, min_y, max_x - min_x + 1.0, max_y - min_y + 1.0],
+        area as f64,
+    )
+}
+
+/// Build the human-readable `note` field:
+/// `"<registry_name> · <quality> · <commit-or-dash>"`.
+fn build_note(meta: &Provenance) -> String {
+    let quality = match meta.operator.quality {
+        LabelQuality::Good => "good",
+        LabelQuality::NeedsReview => "needs_review",
+        LabelQuality::Reject => "reject",
+    };
+    let commit = meta.runtime.snapseg_commit.as_deref().unwrap_or("-");
+    format!("{} · {} · {}", meta.model.registry_name, quality, commit)
+}
+
+/// Extract the label id (directory's bottommost component) as a
+/// `String`. Falls back to an empty string if the path has no file
+/// name component (which the filesystem APIs should never hand us in
+/// practice, but we don't `unwrap` in library code).
+fn label_id_from_dir(label_dir: &Path) -> String {
+    label_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use ndarray::Array2;
+    use snapseg_core::{GrayImage, Point2, Polarity, Prompt, PromptSession};
+
+    use crate::{
+        LabelDir, ModelProvenance, OperatorNote, ProvenanceInputs, RuntimeProvenance,
+        prompts_to_json,
+    };
+
+    fn make_gray_4x4() -> GrayImage {
+        let data = Array2::from_shape_vec((4, 4), (0u8..16).collect()).expect("4x4 shape");
+        GrayImage::from_array(data)
+    }
+
+    fn make_mask_4x4() -> Array2<bool> {
+        let mut m = Array2::<bool>::default((4, 4));
+        m[(1, 1)] = true;
+        m[(1, 2)] = true;
+        m[(2, 1)] = true;
+        m[(2, 2)] = true;
+        m
+    }
+
+    fn make_inputs(quality: LabelQuality) -> ProvenanceInputs {
+        ProvenanceInputs {
+            model: ModelProvenance {
+                registry_name: "test-model".to_string(),
+                family: "test".to_string(),
+                encoder_sha256: None,
+                decoder_sha256: None,
+                model_sha256: Some("deadbeef".to_string()),
+            },
+            runtime: RuntimeProvenance {
+                execution_provider: "CPU".to_string(),
+                encoder_ms: None,
+                decoder_ms: 7,
+                snapseg_commit: Some("abc1234".to_string()),
+            },
+            operator: OperatorNote {
+                note: String::new(),
+                quality,
+            },
+        }
+    }
+
+    fn one_click() -> (PromptSession, Vec<u64>) {
+        let mut s = PromptSession::new();
+        s.push(Prompt::Click {
+            point: Point2::new(1.5, 1.5),
+            polarity: Polarity::Positive,
+        });
+        (s, vec![0])
+    }
+
+    /// Decode an uncompressed COCO RLE back to a row-major u8 mask
+    /// (0 = background, 1 = foreground). Mirror of [`encode_rle`].
+    fn decode_rle(counts: &[u32], h: u32, w: u32) -> Vec<u8> {
+        let h = h as usize;
+        let w = w as usize;
+        let mut out = vec![0u8; h * w];
+        let mut current_val: u8 = 0;
+        let mut linear: usize = 0;
+        for &run in counts {
+            for _ in 0..run {
+                let col = linear / h;
+                let row = linear % h;
+                out[row * w + col] = current_val;
+                linear += 1;
+            }
+            current_val = 1 - current_val;
+        }
+        out
+    }
+
+    #[test]
+    fn convert_single_label_roundtrip() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut dir = LabelDir::new(tmp.path().to_path_buf());
+
+        let gray = make_gray_4x4();
+        let mask = make_mask_4x4();
+        let (session, offsets) = one_click();
+        let prompts = prompts_to_json(&session, &offsets).expect("prompts_to_json");
+        let label = dir
+            .save(
+                None,
+                &gray,
+                prompts,
+                &mask,
+                None,
+                make_inputs(LabelQuality::Good),
+            )
+            .expect("save");
+
+        let ds = convert_dir(tmp.path(), ConvertOptions::default()).expect("convert_dir");
+
+        assert_eq!(ds.images.len(), 1);
+        assert_eq!(ds.annotations.len(), 1);
+        assert_eq!(ds.categories.len(), 1);
+        assert_eq!(ds.categories[0].id, 1);
+        assert_eq!(ds.categories[0].name, "foreground");
+
+        let img = &ds.images[0];
+        assert_eq!(img.width, 4);
+        assert_eq!(img.height, 4);
+        assert_eq!(img.file_name, format!("{}/image.png", label.id));
+        assert!(img.note.contains("test-model"));
+        assert!(img.note.contains("good"));
+        assert!(img.note.contains("abc1234"));
+
+        let ann = &ds.annotations[0];
+        assert_eq!(ann.category_id, 1);
+        assert_eq!(ann.iscrowd, 0);
+        assert!((ann.area - 4.0).abs() < 1e-9);
+        // bbox = [min_x, min_y, w, h] over (col=1..=2, row=1..=2).
+        let expected_bbox = [1.0_f64, 1.0, 2.0, 2.0];
+        for (got, want) in ann.bbox.iter().zip(expected_bbox.iter()) {
+            assert!(
+                (got - want).abs() < 1e-9,
+                "bbox mismatch: got {:?}, want {:?}",
+                ann.bbox,
+                expected_bbox,
+            );
+        }
+
+        // RLE roundtrip: decode back to a 4x4 mask and compare.
+        let CocoSegmentation::UncompressedRle { counts, size } = &ann.segmentation;
+        assert_eq!(*size, [4, 4]);
+        // Sanity: counts sum to total pixels.
+        let total: u32 = counts.iter().copied().sum();
+        assert_eq!(total, 16);
+        let decoded = decode_rle(counts, size[0], size[1]);
+        for ((row, col), &m) in mask.indexed_iter() {
+            let v = decoded[row * 4 + col];
+            let want = u8::from(m);
+            assert_eq!(
+                v, want,
+                "RLE decode mismatch at ({row},{col}): got {v}, want {want}",
+            );
+        }
+    }
+
+    #[test]
+    fn convert_skips_rejected() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut dir = LabelDir::new(tmp.path().to_path_buf());
+
+        let gray = make_gray_4x4();
+        let mask = make_mask_4x4();
+
+        // First label — good.
+        let (s1, o1) = one_click();
+        let p1 = prompts_to_json(&s1, &o1).expect("prompts");
+        dir.save(
+            None,
+            &gray,
+            p1,
+            &mask,
+            None,
+            make_inputs(LabelQuality::Good),
+        )
+        .expect("save good");
+
+        // Second label — rejected. Use a different mask so the source-
+        // image SHA-256 lands in a different bucket if it depends on
+        // mask bytes; the image bytes are unchanged so we expect the
+        // region-suffix path (-r2) to be picked.
+        let (s2, o2) = one_click();
+        let p2 = prompts_to_json(&s2, &o2).expect("prompts");
+        dir.save(
+            None,
+            &gray,
+            p2,
+            &mask,
+            None,
+            make_inputs(LabelQuality::Reject),
+        )
+        .expect("save rejected");
+
+        // Confirm two label directories exist on disk.
+        let label_dirs: Vec<_> = fs::read_dir(tmp.path())
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .collect();
+        assert_eq!(label_dirs.len(), 2, "expected two label dirs on disk");
+
+        let with_skip = convert_dir(
+            tmp.path(),
+            ConvertOptions {
+                skip_rejected: true,
+            },
+        )
+        .expect("convert with skip");
+        assert_eq!(with_skip.images.len(), 1);
+        assert_eq!(with_skip.annotations.len(), 1);
+
+        let no_skip = convert_dir(
+            tmp.path(),
+            ConvertOptions {
+                skip_rejected: false,
+            },
+        )
+        .expect("convert without skip");
+        assert_eq!(no_skip.images.len(), 2);
+        assert_eq!(no_skip.annotations.len(), 2);
+        // Both ids must be present in the no-skip output.
+        let names: Vec<&str> = no_skip
+            .images
+            .iter()
+            .map(|i| i.file_name.as_str())
+            .collect();
+        assert!(names.iter().all(|n| n.ends_with("/image.png")));
+    }
+
+    #[test]
+    fn convert_skips_partial_dirs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut dir = LabelDir::new(tmp.path().to_path_buf());
+
+        let gray = make_gray_4x4();
+        let mask = make_mask_4x4();
+        let (s, o) = one_click();
+        let p = prompts_to_json(&s, &o).expect("prompts");
+        dir.save(None, &gray, p, &mask, None, make_inputs(LabelQuality::Good))
+            .expect("save");
+
+        // Orphan .partial/ from a hypothetical crashed write.
+        fs::create_dir_all(tmp.path().join("orphan.partial")).expect("mkdir partial");
+
+        let ds = convert_dir(tmp.path(), ConvertOptions::default()).expect("convert_dir");
+        assert_eq!(ds.images.len(), 1);
+        assert_eq!(ds.annotations.len(), 1);
+    }
+
+    #[test]
+    fn encode_rle_leading_zero_when_first_pixel_foreground() {
+        // 2x2 mask with (0,0) foreground only. Column-major walk:
+        // col0 row0 -> fg (push leading 0, then run=1), col0 row1 -> bg
+        // (push 1, run=1), col1 row0 -> bg (run=2), col1 row1 -> bg
+        // (run=3). Final push 3 → [0, 1, 3].
+        let mask = vec![
+            255, 0, // row 0
+            0, 0, // row 1
+        ];
+        let counts = encode_rle(&mask, 2, 2);
+        assert_eq!(counts, vec![0, 1, 3], "got {counts:?}");
+    }
+}
