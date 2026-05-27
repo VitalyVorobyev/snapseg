@@ -17,6 +17,9 @@ pub struct RitmSegmenter {
 }
 
 impl RitmSegmenter {
+    /// Construct a placeholder adapter that declares its
+    /// [`Capabilities`] honestly but errors on `segment()`. Useful for
+    /// the model picker UI before the real implementation lands.
     pub fn new(name: impl Into<String>, input_size: (u32, u32)) -> Self {
         Self {
             name: name.into(),
@@ -48,6 +51,8 @@ impl InteractiveSegmenter for RitmSegmenter {
     }
 
     fn segment(&mut self, _session: &PromptSession) -> Result<SegmentationResult, SegError> {
-        Err(SegError::Backend("RITM adapter not yet wired to ort".into()))
+        Err(SegError::Backend(
+            "RITM adapter not yet wired to ort".into(),
+        ))
     }
 }

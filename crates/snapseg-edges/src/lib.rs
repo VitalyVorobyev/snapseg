@@ -13,8 +13,8 @@
 //!   4. Replace the vertex with the refined position. Reject and keep the
 //!      original if the peak prominence is below `min_strength`.
 
-use snapseg_core::{GrayImage, Point2};
 use ndarray::Array2;
+use snapseg_core::{GrayImage, Point2};
 
 /// Tunable knobs for the refinement pass. Defaults aim at ~1 MP grayscale
 /// industrial photos with moderately sharp edges.
@@ -80,17 +80,13 @@ fn naive_boundary(mask: &Array2<bool>) -> Vec<Point2> {
             if !mask[(y, x)] {
                 continue;
             }
-            let mut is_boundary = false;
-            if x == 0 || x + 1 == w || y == 0 || y + 1 == h {
-                is_boundary = true;
-            } else if !mask[(y, x - 1)]
-                || !mask[(y, x + 1)]
-                || !mask[(y - 1, x)]
-                || !mask[(y + 1, x)]
-            {
-                is_boundary = true;
-            }
-            if is_boundary {
+            let on_edge = x == 0 || x + 1 == w || y == 0 || y + 1 == h;
+            let neighbours_off = !on_edge
+                && (!mask[(y, x - 1)]
+                    || !mask[(y, x + 1)]
+                    || !mask[(y - 1, x)]
+                    || !mask[(y + 1, x)]);
+            if on_edge || neighbours_off {
                 out.push(Point2::new(x as f32 + 0.5, y as f32 + 0.5));
             }
         }

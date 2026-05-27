@@ -84,81 +84,28 @@ pub struct Backend {
 }
 
 impl Backend {
-    /// Load a model file into a session. Tries the EPs from
-    /// `config.ep_priority` in order; only those compiled in via their
-    /// feature flag are present in the dispatch list.
+    /// Load a model file into a session.
+    ///
+    /// Tries the execution providers from `config.ep_priority` in order;
+    /// only those compiled in via their feature flag are present in the
+    /// dispatch list. CPU is always present.
+    ///
+    /// # Errors
+    ///
+    /// - [`BackendError::ModelMissing`] if `model_path` doesn't exist.
+    /// - [`BackendError::LoadFailed`] if onnxruntime can't parse or
+    ///   load the file (most often: corrupt ONNX, unsupported op).
+    /// - [`BackendError::Other`] for ort configuration failures.
     pub fn load(model_path: PathBuf, config: &RuntimeConfig) -> Result<Self, BackendError> {
         if !model_path.exists() {
             return Err(BackendError::ModelMissing(model_path));
         }
 
-        let opt = match config.optimization_level {
-            OptLevel::Disable => GraphOptimizationLevel::Disable,
-            OptLevel::Basic => GraphOptimizationLevel::Level1,
-            OptLevel::Extended => GraphOptimizationLevel::Level2,
-            OptLevel::All => GraphOptimizationLevel::Level3,
-        };
+        let builder = configure_builder(config)?;
+        let (eps, chosen) = select_execution_providers(config);
 
-        let mut builder = Session::builder()
-            .map_err(|e| BackendError::Other(format!("session builder: {e}")))?
-            .with_optimization_level(opt)
-            .map_err(|e| BackendError::Other(format!("opt level: {e}")))?;
-
-        if let Some(n) = config.intra_threads {
-            builder = builder
-                .with_intra_threads(n)
-                .map_err(|e| BackendError::Other(format!("intra threads: {e}")))?;
-        }
-        if let Some(n) = config.inter_threads {
-            builder = builder
-                .with_inter_threads(n)
-                .map_err(|e| BackendError::Other(format!("inter threads: {e}")))?;
-        }
-
-        let mut ep_dispatch = Vec::new();
-        #[allow(unused_mut)]
-        let mut chosen = ExecutionProvider::Cpu;
-        for ep in &config.ep_priority {
-            match ep {
-                #[cfg(feature = "tensorrt")]
-                ExecutionProvider::TensorRt => {
-                    ep_dispatch.push(
-                        ort::execution_providers::TensorRTExecutionProvider::default().build(),
-                    );
-                    chosen = *ep;
-                }
-                #[cfg(feature = "cuda")]
-                ExecutionProvider::Cuda => {
-                    ep_dispatch.push(
-                        ort::execution_providers::CUDAExecutionProvider::default().build(),
-                    );
-                    chosen = *ep;
-                }
-                #[cfg(feature = "coreml")]
-                ExecutionProvider::CoreMl => {
-                    ep_dispatch.push(
-                        ort::execution_providers::CoreMLExecutionProvider::default().build(),
-                    );
-                    chosen = *ep;
-                }
-                #[cfg(feature = "directml")]
-                ExecutionProvider::DirectMl => {
-                    ep_dispatch.push(
-                        ort::execution_providers::DirectMLExecutionProvider::default().build(),
-                    );
-                    chosen = *ep;
-                }
-                ExecutionProvider::Cpu => {
-                    ep_dispatch.push(CPUExecutionProvider::default().build());
-                }
-                _ => {
-                    // Provider not built in via its feature flag — skip.
-                }
-            }
-        }
-
-        builder = builder
-            .with_execution_providers(ep_dispatch)
+        let builder = builder
+            .with_execution_providers(eps)
             .map_err(|e| BackendError::Other(format!("execution providers: {e}")))?;
 
         let session = builder
@@ -178,19 +125,102 @@ impl Backend {
         })
     }
 
+    /// Path the backing ONNX file was loaded from.
     pub fn model_path(&self) -> &Path {
         &self.model_path
     }
 
+    /// Execution provider that was actually selected for this session.
+    /// On a CPU-only build, always `Cpu`.
     pub fn execution_provider(&self) -> ExecutionProvider {
         self.chosen_ep
     }
 
-    /// Mutable access to the underlying session — adapters use this to
+    /// Mutable access to the underlying session. Adapters use this to
     /// build input value maps and call `session.run()`.
     pub fn session_mut(&mut self) -> &mut Session {
         &mut self.session
     }
+}
+
+/// Apply graph optimization level + threading config to a fresh
+/// `Session::builder()`. Extracted so [`Backend::load`] stays a thin
+/// orchestrator.
+fn configure_builder(
+    config: &RuntimeConfig,
+) -> Result<ort::session::builder::SessionBuilder, BackendError> {
+    let opt = match config.optimization_level {
+        OptLevel::Disable => GraphOptimizationLevel::Disable,
+        OptLevel::Basic => GraphOptimizationLevel::Level1,
+        OptLevel::Extended => GraphOptimizationLevel::Level2,
+        OptLevel::All => GraphOptimizationLevel::Level3,
+    };
+
+    let mut builder = Session::builder()
+        .map_err(|e| BackendError::Other(format!("session builder: {e}")))?
+        .with_optimization_level(opt)
+        .map_err(|e| BackendError::Other(format!("opt level: {e}")))?;
+
+    if let Some(n) = config.intra_threads {
+        builder = builder
+            .with_intra_threads(n)
+            .map_err(|e| BackendError::Other(format!("intra threads: {e}")))?;
+    }
+    if let Some(n) = config.inter_threads {
+        builder = builder
+            .with_inter_threads(n)
+            .map_err(|e| BackendError::Other(format!("inter threads: {e}")))?;
+    }
+    Ok(builder)
+}
+
+/// Build the ordered list of execution-provider dispatches to feed
+/// `SessionBuilder::with_execution_providers`. Skips entries whose
+/// feature flag isn't enabled at compile time; the returned tag is the
+/// first non-CPU EP that survived feature filtering, falling back to
+/// CPU if none did.
+fn select_execution_providers(
+    config: &RuntimeConfig,
+) -> (
+    Vec<ort::execution_providers::ExecutionProviderDispatch>,
+    ExecutionProvider,
+) {
+    let mut dispatch = Vec::new();
+    #[allow(unused_mut)]
+    let mut chosen = ExecutionProvider::Cpu;
+    for ep in &config.ep_priority {
+        match ep {
+            #[cfg(feature = "tensorrt")]
+            ExecutionProvider::TensorRt => {
+                dispatch
+                    .push(ort::execution_providers::TensorRTExecutionProvider::default().build());
+                chosen = *ep;
+            }
+            #[cfg(feature = "cuda")]
+            ExecutionProvider::Cuda => {
+                dispatch.push(ort::execution_providers::CUDAExecutionProvider::default().build());
+                chosen = *ep;
+            }
+            #[cfg(feature = "coreml")]
+            ExecutionProvider::CoreMl => {
+                dispatch.push(ort::execution_providers::CoreMLExecutionProvider::default().build());
+                chosen = *ep;
+            }
+            #[cfg(feature = "directml")]
+            ExecutionProvider::DirectMl => {
+                dispatch
+                    .push(ort::execution_providers::DirectMLExecutionProvider::default().build());
+                chosen = *ep;
+            }
+            ExecutionProvider::Cpu => {
+                dispatch.push(CPUExecutionProvider::default().build());
+            }
+            _ => {
+                // Provider not built in via its feature flag — skip.
+            }
+        }
+    }
+    (dispatch, chosen)
 }
 
 #[derive(Debug, Error)]
@@ -203,4 +233,6 @@ pub enum BackendError {
     Other(String),
 }
 
+/// Tensor-shaping helpers shared by every adapter: grayscale ↔ RGB,
+/// ImageNet / SAM normalization, resize, SAM letterbox.
 pub mod preprocess;

@@ -6,6 +6,8 @@ use snapseg_core::{
     Capabilities, GrayImage, InteractiveSegmenter, PromptSession, SegError, SegmentationResult,
 };
 
+/// FocalClick `InteractiveSegmenter`. Stub; full wiring lands when the
+/// adapter is needed (model-adapter-integrator task).
 pub struct FocalClickSegmenter {
     name: String,
     input_size: (u32, u32),
@@ -13,6 +15,9 @@ pub struct FocalClickSegmenter {
 }
 
 impl FocalClickSegmenter {
+    /// Construct a placeholder adapter that declares its
+    /// [`Capabilities`] honestly but errors on `segment()`. Useful for
+    /// the model picker UI before the real implementation lands.
     pub fn new(name: impl Into<String>, input_size: (u32, u32)) -> Self {
         Self {
             name: name.into(),
@@ -44,6 +49,8 @@ impl InteractiveSegmenter for FocalClickSegmenter {
     }
 
     fn segment(&mut self, _session: &PromptSession) -> Result<SegmentationResult, SegError> {
-        Err(SegError::Backend("FocalClick adapter not yet wired to ort".into()))
+        Err(SegError::Backend(
+            "FocalClick adapter not yet wired to ort".into(),
+        ))
     }
 }

@@ -1,32 +1,39 @@
 //! MobileSAM adapter (Zhang et al. 2023). Distilled SAM with a tiny image
-//! encoder (~10MB) plus the SAM mask decoder. Click + box prompts; image
-//! embedding is computed once per image, then each prompt is a cheap
-//! decoder pass.
+//! encoder (~10 MB) plus the SAM mask decoder. Click + box prompts; the
+//! image embedding is computed once per image, then each prompt is a
+//! cheap decoder pass.
 //!
-//! Built against the canonical SAM ONNX I/O schema used by the official
-//! Meta export and the most common community MobileSAM exports:
+//! ## ONNX I/O contract
+//!
+//! Built against the canonical SAM ONNX schema used by the official
+//! Meta export and the most common community MobileSAM exports.
 //!
 //! Encoder:
-//!   in   `input_image`      : float32 [1, 3, S, S]
-//!   out  *first*             : float32 [1, 256, S/16, S/16]   (image embedding)
+//! ```text
+//! in   `input_image`      : float32 [1, 3, S, S]            (S typically 1024)
+//! out  *first output*     : float32 [1, 256, S/16, S/16]    image embedding
+//! ```
 //!
 //! Decoder:
-//!   in   `image_embeddings` : float32 [1, 256, h, w]
-//!   in   `point_coords`     : float32 [1, N, 2]
-//!   in   `point_labels`     : float32 [1, N]
-//!   in   `mask_input`       : float32 [1, 1, 256, 256]
-//!   in   `has_mask_input`   : float32 [1]
-//!   in   `orig_im_size`     : float32 [2]   (orig_h, orig_w)
-//!   out  `masks`            : float32 [1, K, orig_h, orig_w]
-//!   out  `iou_predictions`  : float32 [1, K]
-//!   out  `low_res_masks`    : float32 [1, K, 256, 256]
+//! ```text
+//! in   `image_embeddings` : float32 [1, 256, h, w]
+//! in   `point_coords`     : float32 [1, N, 2]               encoder-space pixels
+//! in   `point_labels`     : float32 [1, N]                  1/0/2/3/-1
+//! in   `mask_input`       : float32 [1, 1, 256, 256]
+//! in   `has_mask_input`   : float32 [1]
+//! in   `orig_im_size`     : float32 [2]                     (orig_h, orig_w)
+//! out  `masks`            : float32 [1, K, orig_h, orig_w]
+//! out  `iou_predictions`  : float32 [1, K]
+//! out  `low_res_masks`    : float32 [1, K, 256, 256]
+//! ```
 //!
-//! If a particular export uses different I/O names, the lookups in
-//! `set_image` / `segment` are the only thing that needs to move.
+//! Output name lookups use case-insensitive substring matching with a
+//! fallback to the first output tensor, so minor naming variances in
+//! community exports are tolerated.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ndarray::{Array2, Array3, Array4};
 
@@ -37,6 +44,12 @@ use snapseg_core::{
 use snapseg_runtime::preprocess::{SamResize, sam_preprocess_gray};
 use snapseg_runtime::{Backend, RuntimeConfig};
 
+/// Convenience alias: a tensor extracted as `(shape, data)` of `f32`,
+/// or `None` if the named output isn't present.
+type NamedTensor = Option<(Vec<usize>, Vec<f32>)>;
+
+/// MobileSAM `InteractiveSegmenter`. Owns the encoder + decoder sessions
+/// and caches the image embedding produced by `set_image`.
 pub struct MobileSamSegmenter {
     name: String,
     input_size: u32,
@@ -45,15 +58,25 @@ pub struct MobileSamSegmenter {
     state: Option<EncodedImage>,
 }
 
+/// Per-image state: the encoder's output embedding plus the
+/// preprocessing transform we'll need to map prompt points from image
+/// space into encoder space, plus a cache for iterative refinement.
 struct EncodedImage {
     embedding: Array4<f32>,
     resize_info: SamResize,
-    /// `low_res_masks` from the previous decoder call, fed back as
-    /// `mask_input` to let SAM iteratively refine.
+    /// `low_res_masks` from the previous decoder call. Fed back as
+    /// `mask_input` so SAM can iteratively refine.
     prev_low_res: Option<Array4<f32>>,
 }
 
 impl MobileSamSegmenter {
+    /// Construct from a part map keyed by `"encoder"` and `"decoder"`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SegError::InvalidInput`] if either part is missing,
+    /// and [`SegError::Backend`] if the underlying ort session fails
+    /// to load.
     pub fn from_parts(
         name: String,
         parts: &HashMap<String, PathBuf>,
@@ -98,38 +121,7 @@ impl InteractiveSegmenter for MobileSamSegmenter {
 
     fn set_image(&mut self, image: &GrayImage) -> Result<(), SegError> {
         let (input, resize_info) = sam_preprocess_gray(image, self.input_size as usize);
-
-        let v_input = ort::value::Value::from_array(input)
-            .map_err(|e| SegError::Backend(format!("encoder input value: {e}")))?;
-        let outputs = self
-            .encoder
-            .session_mut()
-            .run(ort::inputs!["input_image" => v_input])
-            .map_err(|e| SegError::Backend(format!("encoder run: {e}")))?;
-
-        // Most exports name the output something with "embedding"; if not,
-        // fall back to the first output tensor.
-        let (_, value) = outputs
-            .iter()
-            .find(|(name, _)| name.to_lowercase().contains("embedding"))
-            .or_else(|| outputs.iter().next())
-            .ok_or_else(|| SegError::Backend("encoder returned no outputs".into()))?;
-
-        let (shape_ref, data) = value
-            .try_extract_tensor::<f32>()
-            .map_err(|e| SegError::Backend(format!("embedding extract: {e}")))?;
-        let shape: Vec<usize> = shape_ref.iter().map(|&d| d as usize).collect();
-        if shape.len() != 4 {
-            return Err(SegError::Backend(format!(
-                "expected 4-D embedding, got shape {shape:?}"
-            )));
-        }
-        let embedding = Array4::from_shape_vec(
-            (shape[0], shape[1], shape[2], shape[3]),
-            data.to_vec(),
-        )
-        .map_err(|e| SegError::Backend(format!("embedding reshape: {e}")))?;
-
+        let embedding = run_encoder(&mut self.encoder, input)?;
         self.state = Some(EncodedImage {
             embedding,
             resize_info,
@@ -142,73 +134,36 @@ impl InteractiveSegmenter for MobileSamSegmenter {
         let started = Instant::now();
         let state = self.state.as_mut().ok_or(SegError::NoImage)?;
 
-        // SAM prompt-label convention:
-        //   1 = positive click, 0 = negative click,
-        //   2 = box top-left,   3 = box bottom-right,
-        //  -1 = padding / "no prompt" slot.
-        let mut coords: Vec<f32> = Vec::new();
-        let mut labels: Vec<f32> = Vec::new();
-        for prompt in &session.prompts {
-            match prompt {
-                Prompt::Click { point, polarity } => {
-                    let (ex, ey) = state.resize_info.point_to_encoder(point.x, point.y);
-                    coords.push(ex);
-                    coords.push(ey);
-                    labels.push(match polarity {
-                        Polarity::Positive => 1.0,
-                        Polarity::Negative => 0.0,
-                    });
-                }
-                Prompt::Box(b) => {
-                    let (x0, y0) = state.resize_info.point_to_encoder(b.x0, b.y0);
-                    let (x1, y1) = state.resize_info.point_to_encoder(b.x1, b.y1);
-                    coords.extend_from_slice(&[x0, y0, x1, y1]);
-                    labels.push(2.0);
-                    labels.push(3.0);
-                }
-                Prompt::Scribble { .. } => {
-                    // MobileSAM does not ingest scribbles via this export.
-                }
-            }
+        let (point_coords, point_labels) = encode_prompts(&session.prompts, &state.resize_info)?;
+        if point_labels.is_empty() {
+            return Ok(empty_result(state, started.elapsed()));
         }
 
-        if labels.is_empty() {
-            let h = state.resize_info.orig_h as usize;
-            let w = state.resize_info.orig_w as usize;
-            return Ok(SegmentationResult {
-                mask: Array2::from_elem((h, w), false),
-                logits: Array2::zeros((h, w)),
-                inference_time: started.elapsed(),
-            });
-        }
-
-        let n_points = labels.len();
-        let point_coords = Array3::from_shape_vec((1, n_points, 2), coords)
-            .map_err(|e| SegError::Backend(e.to_string()))?;
-        let point_labels = Array2::from_shape_vec((1, n_points), labels)
-            .map_err(|e| SegError::Backend(e.to_string()))?;
-
+        // Build the six decoder inputs, run the decoder, and decode +
+        // cache its outputs. Kept inline because `SessionOutputs<'r>`
+        // borrows from the session and is awkward to thread through a
+        // helper signature.
         let mask_input = state
             .prev_low_res
             .clone()
             .unwrap_or_else(|| Array4::<f32>::zeros((1, 1, 256, 256)));
-        let has_mask = if state.prev_low_res.is_some() { 1.0_f32 } else { 0.0 };
+        let has_mask = if state.prev_low_res.is_some() {
+            1.0_f32
+        } else {
+            0.0
+        };
         let has_mask_input = ndarray::arr1(&[has_mask]);
         let orig_im_size = ndarray::arr1(&[
             state.resize_info.orig_h as f32,
             state.resize_info.orig_w as f32,
         ]);
 
-        let mkval = |arr: ndarray::ArrayD<f32>, what: &str| {
-            ort::value::Value::from_array(arr)
-                .map_err(|e| SegError::Backend(format!("{what} value: {e}")))
-        };
-        let v_emb = mkval(state.embedding.clone().into_dyn(), "image_embeddings")?;
-        let v_coords = mkval(point_coords.into_dyn(), "point_coords")?;
-        let v_labels = mkval(point_labels.into_dyn(), "point_labels")?;
-        let v_mask = mkval(mask_input.into_dyn(), "mask_input")?;
-        let v_has = mkval(has_mask_input.into_dyn(), "has_mask_input")?;
-        let v_orig = mkval(orig_im_size.into_dyn(), "orig_im_size")?;
+        let v_emb = into_dyn_value(state.embedding.clone(), "image_embeddings")?;
+        let v_coords = into_dyn_value(point_coords, "point_coords")?;
+        let v_labels = into_dyn_value(point_labels, "point_labels")?;
+        let v_mask = into_dyn_value(mask_input, "mask_input")?;
+        let v_has = into_dyn_value(has_mask_input, "has_mask_input")?;
+        let v_orig = into_dyn_value(orig_im_size, "orig_im_size")?;
 
         let outputs = self
             .decoder
@@ -223,55 +178,13 @@ impl InteractiveSegmenter for MobileSamSegmenter {
             ])
             .map_err(|e| SegError::Backend(format!("decoder run: {e}")))?;
 
-        let masks_value = outputs
-            .iter()
-            .find(|(name, _)| name.to_lowercase() == "masks")
-            .map(|(_, v)| v)
+        let (mask_shape, mask_data) = extract_named(&outputs, "masks")?
             .ok_or_else(|| SegError::Backend("decoder missing 'masks' output".into()))?;
-        let (m_shape_ref, m_data) = masks_value
-            .try_extract_tensor::<f32>()
-            .map_err(|e| SegError::Backend(format!("masks extract: {e}")))?;
-        let m_shape: Vec<usize> = m_shape_ref.iter().map(|&d| d as usize).collect();
-        if m_shape.len() != 4 {
-            return Err(SegError::Backend(format!(
-                "expected 4-D masks, got {m_shape:?}"
-            )));
-        }
-        let (n, k, h, w) = (m_shape[0], m_shape[1], m_shape[2], m_shape[3]);
-        if n != 1 || k == 0 {
-            return Err(SegError::Backend(format!(
-                "unexpected masks shape {m_shape:?}"
-            )));
-        }
+        let (mask, logits) = decode_first_mask(mask_shape, &mask_data)?;
 
-        // First of K predicted masks. Multi-mask selection (by IoU
-        // prediction) is a refinement for later.
-        let stride_per_mask = h * w;
-        let mut logits = Array2::<f32>::zeros((h, w));
-        let mut mask = Array2::<bool>::from_elem((h, w), false);
-        for y in 0..h {
-            for x in 0..w {
-                let v = m_data[y * w + x];
-                logits[(y, x)] = v;
-                mask[(y, x)] = v > 0.0;
-            }
-        }
-        let _ = stride_per_mask; // currently only mask 0 consumed; kept for the next iteration.
-
-        if let Some((_, lr_value)) = outputs
-            .iter()
-            .find(|(name, _)| name.to_lowercase() == "low_res_masks")
-        {
-            if let Ok((lr_shape_ref, lr_data)) = lr_value.try_extract_tensor::<f32>() {
-                let lr_shape: Vec<usize> = lr_shape_ref.iter().map(|&d| d as usize).collect();
-                if lr_shape.len() == 4 {
-                    if let Ok(lr_owned) = Array4::from_shape_vec(
-                        (lr_shape[0], lr_shape[1], lr_shape[2], lr_shape[3]),
-                        lr_data.to_vec(),
-                    ) {
-                        state.prev_low_res = Some(lr_owned);
-                    }
-                }
+        if let Some((lr_shape, lr_data)) = extract_named(&outputs, "low_res_masks")? {
+            if let Some(lr) = into_low_res(lr_shape, lr_data) {
+                state.prev_low_res = Some(lr);
             }
         }
 
@@ -288,4 +201,192 @@ impl InteractiveSegmenter for MobileSamSegmenter {
             inference_time: elapsed,
         })
     }
+}
+
+/// Run the encoder and reshape its first 4-D output into the cached
+/// `[1, 256, S/16, S/16]` embedding tensor.
+fn run_encoder(encoder: &mut Backend, input: Array4<f32>) -> Result<Array4<f32>, SegError> {
+    let v_input = ort::value::Value::from_array(input)
+        .map_err(|e| SegError::Backend(format!("encoder input value: {e}")))?;
+    let outputs = encoder
+        .session_mut()
+        .run(ort::inputs!["input_image" => v_input])
+        .map_err(|e| SegError::Backend(format!("encoder run: {e}")))?;
+
+    // Pick the first output whose name contains "embedding", else fall
+    // back to the first output regardless of name.
+    let pick: Option<(Vec<usize>, Vec<f32>)> = {
+        let mut chosen = None;
+        for (name, value) in outputs.iter() {
+            if name.to_lowercase().contains("embedding") {
+                let (shape_ref, data) = value
+                    .try_extract_tensor::<f32>()
+                    .map_err(|e| SegError::Backend(format!("embedding extract: {e}")))?;
+                chosen = Some((
+                    shape_ref.iter().map(|&d| d as usize).collect(),
+                    data.to_vec(),
+                ));
+                break;
+            }
+        }
+        if chosen.is_none() {
+            if let Some((_, value)) = outputs.iter().next() {
+                let (shape_ref, data) = value
+                    .try_extract_tensor::<f32>()
+                    .map_err(|e| SegError::Backend(format!("embedding extract: {e}")))?;
+                chosen = Some((
+                    shape_ref.iter().map(|&d| d as usize).collect(),
+                    data.to_vec(),
+                ));
+            }
+        }
+        chosen
+    };
+
+    let (shape, data) =
+        pick.ok_or_else(|| SegError::Backend("encoder returned no outputs".into()))?;
+    if shape.len() != 4 {
+        return Err(SegError::Backend(format!(
+            "expected 4-D embedding, got shape {shape:?}"
+        )));
+    }
+    Array4::from_shape_vec((shape[0], shape[1], shape[2], shape[3]), data)
+        .map_err(|e| SegError::Backend(format!("embedding reshape: {e}")))
+}
+
+/// Build the SAM `point_coords` / `point_labels` tensors from a prompt
+/// session in image-space coordinates.
+///
+/// Label convention: 1 = positive click, 0 = negative click,
+/// 2 = box top-left, 3 = box bottom-right, −1 = padding (unused here).
+/// Scribbles are ignored — the canonical MobileSAM export doesn't
+/// ingest them.
+fn encode_prompts(
+    prompts: &[Prompt],
+    resize_info: &SamResize,
+) -> Result<(Array3<f32>, Array2<f32>), SegError> {
+    let mut coords: Vec<f32> = Vec::new();
+    let mut labels: Vec<f32> = Vec::new();
+    for prompt in prompts {
+        match prompt {
+            Prompt::Click { point, polarity } => {
+                let (ex, ey) = resize_info.point_to_encoder(point.x, point.y);
+                coords.push(ex);
+                coords.push(ey);
+                labels.push(match polarity {
+                    Polarity::Positive => 1.0,
+                    Polarity::Negative => 0.0,
+                });
+            }
+            Prompt::Box(b) => {
+                let (x0, y0) = resize_info.point_to_encoder(b.x0, b.y0);
+                let (x1, y1) = resize_info.point_to_encoder(b.x1, b.y1);
+                coords.extend_from_slice(&[x0, y0, x1, y1]);
+                labels.push(2.0);
+                labels.push(3.0);
+            }
+            Prompt::Scribble { .. } => {
+                // MobileSAM doesn't consume scribbles in this export.
+            }
+        }
+    }
+    if labels.is_empty() {
+        return Ok((
+            Array3::<f32>::zeros((1, 0, 2)),
+            Array2::<f32>::zeros((1, 0)),
+        ));
+    }
+    let n = labels.len();
+    let point_coords = Array3::from_shape_vec((1, n, 2), coords)
+        .map_err(|e| SegError::Backend(format!("point_coords shape: {e}")))?;
+    let point_labels = Array2::from_shape_vec((1, n), labels)
+        .map_err(|e| SegError::Backend(format!("point_labels shape: {e}")))?;
+    Ok((point_coords, point_labels))
+}
+
+/// Decode the first of K predicted masks into `(mask, logits)` at its
+/// native resolution. Multi-mask selection (by IoU prediction) is a
+/// refinement for a later milestone.
+fn decode_first_mask(
+    shape: Vec<usize>,
+    data: &[f32],
+) -> Result<(Array2<bool>, Array2<f32>), SegError> {
+    if shape.len() != 4 {
+        return Err(SegError::Backend(format!(
+            "expected 4-D masks, got {shape:?}"
+        )));
+    }
+    let (n, k, h, w) = (shape[0], shape[1], shape[2], shape[3]);
+    if n != 1 || k == 0 {
+        return Err(SegError::Backend(format!(
+            "unexpected masks shape {shape:?}"
+        )));
+    }
+    let mut logits = Array2::<f32>::zeros((h, w));
+    let mut mask = Array2::<bool>::from_elem((h, w), false);
+    for y in 0..h {
+        for x in 0..w {
+            let v = data[y * w + x];
+            logits[(y, x)] = v;
+            mask[(y, x)] = v > 0.0;
+        }
+    }
+    Ok((mask, logits))
+}
+
+/// Build the cached `low_res_masks` tensor for the next iteration.
+/// Returns `None` if the shape doesn't match the expected
+/// `[1, 1, 256, 256]` so the caller can silently skip the update.
+fn into_low_res(shape: Vec<usize>, data: Vec<f32>) -> Option<Array4<f32>> {
+    if shape.len() != 4 {
+        return None;
+    }
+    Array4::from_shape_vec((shape[0], shape[1], shape[2], shape[3]), data).ok()
+}
+
+/// All-false mask at the source resolution. Returned when the prompt
+/// session is empty after filtering — SAM requires at least one prompt
+/// to produce anything useful.
+fn empty_result(state: &EncodedImage, elapsed: Duration) -> SegmentationResult {
+    let h = state.resize_info.orig_h as usize;
+    let w = state.resize_info.orig_w as usize;
+    SegmentationResult {
+        mask: Array2::from_elem((h, w), false),
+        logits: Array2::zeros((h, w)),
+        inference_time: elapsed,
+    }
+}
+
+/// Find a named output, extract it as `(shape, data)` of `f32`. Returns
+/// `Ok(None)` if the name isn't present; only errors when extraction
+/// itself fails.
+fn extract_named<'r>(
+    outputs: &ort::session::SessionOutputs<'r>,
+    name: &str,
+) -> Result<NamedTensor, SegError> {
+    let lc = name.to_lowercase();
+    for (out_name, value) in outputs.iter() {
+        if out_name.to_lowercase() == lc {
+            let (shape_ref, data) = value
+                .try_extract_tensor::<f32>()
+                .map_err(|e| SegError::Backend(format!("{name} extract: {e}")))?;
+            return Ok(Some((
+                shape_ref.iter().map(|&d| d as usize).collect(),
+                data.to_vec(),
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// Build an `ort` `DynValue` from a strongly-typed `ndarray::Array`.
+/// `into_dyn_value` erases the typed `Value<TensorValueType<f32>>` into
+/// the dyn-typed value `ort::inputs!` expects.
+fn into_dyn_value<D: ndarray::Dimension>(
+    arr: ndarray::Array<f32, D>,
+    what: &str,
+) -> Result<ort::value::DynValue, SegError> {
+    ort::value::Value::from_array(arr.into_dyn())
+        .map_err(|e| SegError::Backend(format!("{what} value: {e}")))
+        .map(|v| v.into_dyn())
 }

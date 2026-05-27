@@ -9,14 +9,20 @@
 use ndarray::{Array3, Array4, Axis, s};
 use snapseg_core::GrayImage;
 
-/// Standard ImageNet normalization constants (in [0, 1] pixel range).
-/// Most click-based segmenters were trained on COCO/LVIS/Pascal with these.
+/// Per-channel ImageNet mean (R, G, B) on pixels in the `[0, 1]` range.
 pub const IMAGENET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
+
+/// Per-channel ImageNet standard deviation (R, G, B) on pixels in the
+/// `[0, 1]` range. Used together with [`IMAGENET_MEAN`].
 pub const IMAGENET_STD: [f32; 3] = [0.229, 0.224, 0.225];
 
-/// SAM / MobileSAM pixel-space stats — applied to pixels in the [0, 255]
-/// range, *not* [0, 1]. See SamPredictor.set_image in the official repo.
+/// Per-channel SAM / MobileSAM mean (R, G, B) on pixels in the
+/// `[0, 255]` range. SAM does *not* rescale to `[0, 1]` before
+/// normalization; pass the byte-valued tensor straight through.
 pub const SAM_PIXEL_MEAN: [f32; 3] = [123.675, 116.28, 103.53];
+
+/// Per-channel SAM / MobileSAM standard deviation (R, G, B) on pixels in
+/// the `[0, 255]` range. Used together with [`SAM_PIXEL_MEAN`].
 pub const SAM_PIXEL_STD: [f32; 3] = [58.395, 57.12, 57.375];
 
 /// Replicate a `[H, W]` u8 grayscale image into a `[3, H, W]` float tensor
@@ -59,10 +65,15 @@ pub fn normalize_chw(chw: &mut Array3<f32>, mean: [f32; 3], std: [f32; 3]) {
     }
 }
 
+/// Apply [`IMAGENET_MEAN`] / [`IMAGENET_STD`] in place. Convenience
+/// wrapper over [`normalize_chw`] for the most common per-channel
+/// recipe used by click-based segmenters.
 pub fn normalize_imagenet(chw: &mut Array3<f32>) {
     normalize_chw(chw, IMAGENET_MEAN, IMAGENET_STD);
 }
 
+/// Apply [`SAM_PIXEL_MEAN`] / [`SAM_PIXEL_STD`] in place. Convenience
+/// wrapper for SAM-family adapters.
 pub fn normalize_sam(chw: &mut Array3<f32>) {
     normalize_chw(chw, SAM_PIXEL_MEAN, SAM_PIXEL_STD);
 }
@@ -143,9 +154,7 @@ pub fn sam_preprocess_gray(image: &GrayImage, target: usize) -> (Array4<f32>, Sa
 
     // 3) paste into a (3, target, target) zero-padded canvas
     let mut canvas = Array3::<f32>::zeros((3, target, target));
-    canvas
-        .slice_mut(s![.., ..new_h, ..new_w])
-        .assign(&resized);
+    canvas.slice_mut(s![.., ..new_h, ..new_w]).assign(&resized);
 
     // 4) SAM normalize in-place (still [0, 255] before)
     normalize_sam(&mut canvas);

@@ -49,9 +49,15 @@ pub enum Polarity {
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum Prompt {
-    Click { point: Point2, polarity: Polarity },
+    Click {
+        point: Point2,
+        polarity: Polarity,
+    },
     Box(BBox),
-    Scribble { points: Vec<Point2>, polarity: Polarity },
+    Scribble {
+        points: Vec<Point2>,
+        polarity: Polarity,
+    },
 }
 
 /// Accumulated user input for one segmentation pass. `prev_logits` lets
@@ -117,7 +123,11 @@ pub struct GrayImage {
 impl GrayImage {
     pub fn from_array(data: Array2<u8>) -> Self {
         let (h, w) = data.dim();
-        Self { width: w as u32, height: h as u32, data }
+        Self {
+            width: w as u32,
+            height: h as u32,
+            data,
+        }
     }
 }
 

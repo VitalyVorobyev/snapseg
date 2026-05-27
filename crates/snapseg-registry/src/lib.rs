@@ -84,7 +84,10 @@ pub fn default_cache_dir() -> PathBuf {
 
 /// Resolve every part of a model entry to a local path. Returns a map keyed
 /// by part name (`"encoder"`, `"decoder"`, `"model"`, ...).
-pub fn resolve(entry: &ModelEntry, cache_dir: &Path) -> Result<HashMap<String, PathBuf>, RegistryError> {
+pub fn resolve(
+    entry: &ModelEntry,
+    cache_dir: &Path,
+) -> Result<HashMap<String, PathBuf>, RegistryError> {
     let mut out = HashMap::with_capacity(entry.parts.len());
     fs::create_dir_all(cache_dir)?;
     for part in &entry.parts {
