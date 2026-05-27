@@ -67,6 +67,12 @@ pub struct SnapsegApp {
     pub(crate) last_logits: Option<ndarray::Array2<f32>>,
     /// Status line of the last save attempt; surfaced in the side panel.
     pub(crate) last_save_status: Option<String>,
+    /// Quality flag the operator will attach to the next saved label.
+    /// Reset to `Good` after each successful save.
+    pub(crate) pending_quality: snapseg_labels::LabelQuality,
+    /// Free-form note the operator will attach to the next saved label.
+    /// Cleared after each successful save.
+    pub(crate) pending_note: String,
 }
 
 impl Default for SnapsegApp {
@@ -92,6 +98,8 @@ impl Default for SnapsegApp {
             last_mask: None,
             last_logits: None,
             last_save_status: None,
+            pending_quality: snapseg_labels::LabelQuality::Good,
+            pending_note: String::new(),
         }
     }
 }

@@ -46,7 +46,10 @@ pub(crate) fn build_provenance_inputs(app: &SnapsegApp) -> ProvenanceInputs {
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string()),
         },
-        operator: OperatorNote::default(),
+        operator: OperatorNote {
+            note: app.pending_note.clone(),
+            quality: app.pending_quality,
+        },
     }
 }
 

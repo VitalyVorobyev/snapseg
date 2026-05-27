@@ -10,6 +10,9 @@ use crate::labels;
 impl SnapsegApp {
     /// Right side panel: open / load / polarity toggle / prompt counter
     /// / model + embedding status / latency.
+    // why this is long: UI-rendering with section discipline; reads top
+    // to bottom matching on-screen order, which is clearer than
+    // fragmenting it into per-section helpers that each take `&mut self`.
     pub(crate) fn draw_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.heading("snapseg");
         ui.separator();
@@ -68,6 +71,30 @@ impl SnapsegApp {
             self.pick_label_dir_dialog();
         }
 
+        ui.add_space(4.0);
+        ui.label("Quality:");
+        ui.horizontal(|ui| {
+            ui.selectable_value(
+                &mut self.pending_quality,
+                snapseg_labels::LabelQuality::Good,
+                "Good",
+            );
+            ui.selectable_value(
+                &mut self.pending_quality,
+                snapseg_labels::LabelQuality::NeedsReview,
+                "Needs review",
+            );
+            ui.selectable_value(
+                &mut self.pending_quality,
+                snapseg_labels::LabelQuality::Reject,
+                "Reject",
+            );
+        });
+
+        ui.add_space(2.0);
+        ui.label("Note:");
+        ui.text_edit_singleline(&mut self.pending_note);
+
         let save_enabled =
             self.image.is_some() && self.last_mask.is_some() && self.segmenter_family.is_some();
         ui.add_space(4.0);
@@ -79,6 +106,8 @@ impl SnapsegApp {
                 Ok(label) => {
                     tracing::info!(id = %label.id, dir = %label.dir.display(), "label saved");
                     self.last_save_status = Some(format!("Saved {}", label.id));
+                    self.pending_note.clear();
+                    self.pending_quality = snapseg_labels::LabelQuality::Good;
                 }
                 Err(e) => {
                     tracing::error!("save label failed: {e}");
