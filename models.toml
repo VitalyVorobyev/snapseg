@@ -1,36 +1,54 @@
 # Default snapseg model registry.
 #
-# Entries below are placeholders pending Phase-1 wiring: real URLs and
-# sha256 sums land once each adapter is plumbed against its exported ONNX
-# file. Until then the entries document the *shape* of the registry and
-# serve as fixtures for the resolver code.
-
-[[model]]
-name = "ritm-hrnet18-cocolvis"
-family = "ritm"
-url = "https://example.invalid/ritm-hrnet18-cocolvis.onnx"
-sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
-size_mb = 41
-input_size = [1024, 1024]
-license = "MIT"
-notes = "RITM HRNet-18 trained on COCO+LVIS. Click-driven, no box."
-
-[[model]]
-name = "focalclick-hrnet18s2"
-family = "focalclick"
-url = "https://example.invalid/focalclick-hrnet18s2.onnx"
-sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
-size_mb = 39
-input_size = [1024, 1024]
-license = "MIT"
-notes = "FocalClick HRNet18-S2. Local-crop refinement keeps subsequent clicks cheap on CPU."
+# Each `[[model]]` declares one or more `[[model.parts]]`. Single-network
+# models name their part `"model"`; SAM-family models split into
+# `"encoder"` (run once per image) and `"decoder"` (run per prompt).
+#
+# A sha256 of all zeros means "trust whatever is cached" — useful during
+# early bring-up before a real hash is pinned. Replace with the actual
+# digest once an export is blessed for the project.
 
 [[model]]
 name = "mobile-sam"
 family = "mobile_sam"
-url = "https://example.invalid/mobile_sam.onnx"
-sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
-size_mb = 41
 input_size = [1024, 1024]
 license = "Apache-2.0"
 notes = "Distilled SAM with TinyViT encoder. Click + box prompts."
+
+[[model.parts]]
+name = "encoder"
+url = "https://huggingface.co/snapseg/onnx/resolve/main/mobile_sam_encoder.onnx"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+size_mb = 27
+
+[[model.parts]]
+name = "decoder"
+url = "https://huggingface.co/snapseg/onnx/resolve/main/mobile_sam_decoder.onnx"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+size_mb = 16
+
+[[model]]
+name = "ritm-hrnet18-cocolvis"
+family = "ritm"
+input_size = [1024, 1024]
+license = "MIT"
+notes = "RITM HRNet-18 on COCO+LVIS. Click-driven; one network call per click."
+
+[[model.parts]]
+name = "model"
+url = "https://example.invalid/ritm-hrnet18-cocolvis.onnx"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+size_mb = 41
+
+[[model]]
+name = "focalclick-hrnet18s2"
+family = "focalclick"
+input_size = [1024, 1024]
+license = "MIT"
+notes = "FocalClick HRNet18-S2. Local-crop refinement keeps subsequent clicks cheap on CPU."
+
+[[model.parts]]
+name = "model"
+url = "https://example.invalid/focalclick-hrnet18s2.onnx"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+size_mb = 39

@@ -1,6 +1,12 @@
 //! Model registry: TOML schema, cache resolution, sha256-verified
 //! downloads. The app's model picker is built on this.
+//!
+//! Entries are multi-part because SAM-family models ship as two ONNX
+//! files (image encoder + mask decoder); single-network models like RITM
+//! simply declare one part. Adapters look up the part they need by name
+//! (e.g. `"encoder"`, `"decoder"`, or `"model"`).
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -10,9 +16,20 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-/// One entry in `models.toml`. The fields mirror what an adapter needs to
-/// load a model: where to get it, how big to expect, what input shape it
-/// was exported with.
+/// One downloadable ONNX file. A model entry has one or more of these.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelPart {
+    /// Logical name an adapter looks up. Conventions:
+    ///   - `"model"`     for single-network models (RITM, FocalClick, ...)
+    ///   - `"encoder"`/`"decoder"` for SAM-family two-stage models.
+    pub name: String,
+    pub url: String,
+    pub sha256: String,
+    pub size_mb: u32,
+}
+
+/// One entry in `models.toml`. Adapters dispatch on `family` and pick the
+/// `ModelPart` they need by name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelEntry {
     pub name: String,
@@ -20,16 +37,22 @@ pub struct ModelEntry {
     /// Known values: "ritm", "focalclick", "mobile_sam", "efficient_sam",
     /// "sam2_tiny".
     pub family: String,
-    /// HTTP(S) URL to fetch the ONNX file from when missing.
-    pub url: String,
-    /// Hex-encoded SHA-256 of the ONNX file.
-    pub sha256: String,
-    pub size_mb: u32,
-    /// `[height, width]` the model expects.
+    /// `[height, width]` the model was exported for. Single-network models
+    /// take this as their resize target; SAM-family models use it as the
+    /// encoder input shape.
     pub input_size: [u32; 2],
     pub license: String,
     #[serde(default)]
     pub notes: String,
+    /// One or more ONNX files that make up this model.
+    #[serde(default)]
+    pub parts: Vec<ModelPart>,
+}
+
+impl ModelEntry {
+    pub fn part(&self, name: &str) -> Option<&ModelPart> {
+        self.parts.iter().find(|p| p.name == name)
+    }
 }
 
 /// Top-level TOML file structure.
@@ -40,14 +63,12 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// Parse a TOML file into a registry.
     pub fn from_toml_file(path: &Path) -> Result<Self, RegistryError> {
         let text = fs::read_to_string(path)?;
         let reg: Registry = toml::from_str(&text)?;
         Ok(reg)
     }
 
-    /// Look up an entry by `name`.
     pub fn get(&self, name: &str) -> Option<&ModelEntry> {
         self.models.iter().find(|m| m.name == name)
     }
@@ -61,32 +82,34 @@ pub fn default_cache_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("./models"))
 }
 
-/// Resolve an entry to an on-disk path: returns the cached path if present
-/// and sha256-valid, otherwise downloads (when the `download` feature is
-/// enabled) and verifies.
-pub fn resolve(entry: &ModelEntry, cache_dir: &Path) -> Result<PathBuf, RegistryError> {
-    let dest = cache_dir.join(format!("{}.onnx", entry.name));
-    if dest.exists() && verify_sha256(&dest, &entry.sha256)? {
-        return Ok(dest);
-    }
-    #[cfg(feature = "download")]
-    {
-        fs::create_dir_all(cache_dir)?;
-        download(&entry.url, &dest)?;
-        if !verify_sha256(&dest, &entry.sha256)? {
-            return Err(RegistryError::Sha256Mismatch {
-                name: entry.name.clone(),
-            });
+/// Resolve every part of a model entry to a local path. Returns a map keyed
+/// by part name (`"encoder"`, `"decoder"`, `"model"`, ...).
+pub fn resolve(entry: &ModelEntry, cache_dir: &Path) -> Result<HashMap<String, PathBuf>, RegistryError> {
+    let mut out = HashMap::with_capacity(entry.parts.len());
+    fs::create_dir_all(cache_dir)?;
+    for part in &entry.parts {
+        let dest = cache_dir.join(format!("{}--{}.onnx", entry.name, part.name));
+        if !(dest.exists() && verify_sha256(&dest, &part.sha256)?) {
+            #[cfg(feature = "download")]
+            {
+                download(&part.url, &dest)?;
+                if !verify_sha256(&dest, &part.sha256)? {
+                    return Err(RegistryError::Sha256Mismatch {
+                        name: format!("{}/{}", entry.name, part.name),
+                    });
+                }
+            }
+            #[cfg(not(feature = "download"))]
+            {
+                return Err(RegistryError::Missing {
+                    name: format!("{}/{}", entry.name, part.name),
+                    path: dest,
+                });
+            }
         }
-        return Ok(dest);
+        out.insert(part.name.clone(), dest);
     }
-    #[cfg(not(feature = "download"))]
-    {
-        Err(RegistryError::Missing {
-            name: entry.name.clone(),
-            path: dest,
-        })
-    }
+    Ok(out)
 }
 
 /// SHA-256 of a file as lowercase hex.
@@ -105,6 +128,11 @@ pub fn file_sha256(path: &Path) -> Result<String, RegistryError> {
 }
 
 fn verify_sha256(path: &Path, expected_hex: &str) -> Result<bool, RegistryError> {
+    // Empty sha (or all zeros) means "trust whatever is cached" — useful
+    // during early bring-up before a real hash is pinned.
+    if expected_hex.is_empty() || expected_hex.chars().all(|c| c == '0') {
+        return Ok(true);
+    }
     let got = file_sha256(path)?;
     Ok(got.eq_ignore_ascii_case(expected_hex))
 }
