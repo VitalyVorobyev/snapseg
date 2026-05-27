@@ -69,6 +69,17 @@ fn capture_click(
     } else {
         app.current_polarity
     };
+    // Track per-prompt timing in lockstep with `session.prompts` so the
+    // `t_ms` field on the saved label matches the order of clicks.
+    let now = std::time::Instant::now();
+    let t_ms = match app.first_prompt_at {
+        Some(start) => (now - start).as_millis() as u64,
+        None => {
+            app.first_prompt_at = Some(now);
+            0
+        }
+    };
+    app.prompt_t_ms.push(t_ms);
     app.session.push(Prompt::Click {
         point: img_pt,
         polarity,

@@ -5,6 +5,7 @@ use eframe::egui;
 use snapseg_core::Polarity;
 
 use crate::app::SnapsegApp;
+use crate::labels;
 
 impl SnapsegApp {
     /// Right side panel: open / load / polarity toggle / prompt counter
@@ -37,8 +38,12 @@ impl SnapsegApp {
         ui.label(format!("Prompts: {}", self.session.prompts.len()));
         if ui.button("Clear prompts").clicked() {
             self.session.clear();
+            self.prompt_t_ms.clear();
+            self.first_prompt_at = None;
             self.mask_texture = None;
             self.last_inference_ms = None;
+            self.last_mask = None;
+            self.last_logits = None;
         }
 
         ui.add_space(8.0);
@@ -55,7 +60,40 @@ impl SnapsegApp {
                 "pending"
             }
         ));
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.label(format!("Labels: {}", self.label_dir.root.display()));
+        if ui.button("Change…").clicked() {
+            self.pick_label_dir_dialog();
+        }
+
+        let save_enabled =
+            self.image.is_some() && self.last_mask.is_some() && self.segmenter_family.is_some();
+        ui.add_space(4.0);
+        if ui
+            .add_enabled(save_enabled, egui::Button::new("Save label"))
+            .clicked()
+        {
+            match labels::save_current_label(self) {
+                Ok(label) => {
+                    tracing::info!(id = %label.id, dir = %label.dir.display(), "label saved");
+                    self.last_save_status = Some(format!("Saved {}", label.id));
+                }
+                Err(e) => {
+                    tracing::error!("save label failed: {e}");
+                    self.last_save_status = Some(format!("Save failed: {e}"));
+                }
+            }
+        }
+        match &self.last_save_status {
+            Some(s) => ui.label(format!("Last save: {s}")),
+            None => ui.label("Last save: (none yet)"),
+        };
+
         if let Some(ms) = self.last_inference_ms {
+            ui.add_space(8.0);
+            ui.separator();
             ui.label(format!("Last segment: {ms} ms"));
         }
     }

@@ -39,6 +39,34 @@ pub struct SnapsegApp {
     pub(crate) mask_texture: Option<egui::TextureHandle>,
     /// Wall-clock duration of the last `segment` call, surfaced in the panel.
     pub(crate) last_inference_ms: Option<u64>,
+    /// Where labels are persisted on disk. Defaults to `./labels/`.
+    pub(crate) label_dir: snapseg_labels::LabelDir,
+    /// Per-prompt timestamp offsets, parallel to `session.prompts`. Zero
+    /// for the first prompt; ms since the first prompt for subsequent
+    /// ones. Reset when the prompt session is cleared.
+    pub(crate) prompt_t_ms: Vec<u64>,
+    /// Instant of the first prompt of the current session, used to
+    /// compute `prompt_t_ms`.
+    pub(crate) first_prompt_at: Option<std::time::Instant>,
+    /// Family slug of the active segmenter, e.g. `"mobile_sam"`. Set
+    /// when a model is loaded; needed for provenance.
+    pub(crate) segmenter_family: Option<String>,
+    /// Registry name of the active segmenter, e.g. `"mobile-sam"`. Set
+    /// when a model is loaded.
+    pub(crate) segmenter_registry_name: Option<String>,
+    /// Cached SHA-256 of the encoder ONNX, if any. Set when loading.
+    pub(crate) encoder_sha256: Option<String>,
+    /// Cached SHA-256 of the decoder ONNX, if any. Set when loading.
+    pub(crate) decoder_sha256: Option<String>,
+    /// Most recent encoder pass duration (ms). Set by `run_set_image`.
+    pub(crate) last_encoder_ms: Option<u64>,
+    /// Most recent mask. Held so the user can save it as a label long
+    /// after the segment call. Replaced on every successful segment.
+    pub(crate) last_mask: Option<ndarray::Array2<bool>>,
+    /// Most recent logits (for `logits.png` in the saved label).
+    pub(crate) last_logits: Option<ndarray::Array2<f32>>,
+    /// Status line of the last save attempt; surfaced in the side panel.
+    pub(crate) last_save_status: Option<String>,
 }
 
 impl Default for SnapsegApp {
@@ -53,6 +81,17 @@ impl Default for SnapsegApp {
             embedding_ready: false,
             mask_texture: None,
             last_inference_ms: None,
+            label_dir: snapseg_labels::LabelDir::new(std::path::PathBuf::from("./labels")),
+            prompt_t_ms: Vec::new(),
+            first_prompt_at: None,
+            segmenter_family: None,
+            segmenter_registry_name: None,
+            encoder_sha256: None,
+            decoder_sha256: None,
+            last_encoder_ms: None,
+            last_mask: None,
+            last_logits: None,
+            last_save_status: None,
         }
     }
 }

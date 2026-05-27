@@ -16,6 +16,7 @@ mod canvas;
 mod coords;
 mod dialogs;
 mod inference;
+mod labels;
 mod panel;
 mod textures;
 
