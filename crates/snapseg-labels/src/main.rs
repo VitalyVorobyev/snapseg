@@ -35,6 +35,11 @@ enum Cmd {
         /// include rejected labels.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         skip_rejected: bool,
+        /// When set, the first per-label error aborts conversion.
+        /// When unset (default), corrupt labels are skipped with a warning
+        /// and the count is reported after writing the output file.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        strict: bool,
     },
 }
 
@@ -45,13 +50,22 @@ fn main() -> anyhow::Result<()> {
             r#in,
             out,
             skip_rejected,
+            strict,
         } => {
-            let n = snapseg_labels::coco::convert_dir_to_file(
+            let report = snapseg_labels::coco::convert_dir_to_file(
                 &r#in,
                 &out,
-                snapseg_labels::coco::ConvertOptions { skip_rejected },
+                snapseg_labels::coco::ConvertOptions {
+                    skip_rejected,
+                    strict,
+                },
             )?;
-            eprintln!("wrote {} labels to {}", n, out.display());
+            eprintln!(
+                "wrote {} labels to {} (skipped {})",
+                report.dataset.images.len(),
+                out.display(),
+                report.skipped,
+            );
         }
     }
     Ok(())
