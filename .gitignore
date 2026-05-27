@@ -1,7 +1,29 @@
+# Rust
 /target
 /Cargo.lock
+**/*.rs.bk
+
+# Project artifacts
 /models/
 *.onnx
+/labels/
+/scratch/
+
+# macOS
 .DS_Store
+
+# Editors
 .idea/
 .vscode/
+*.swp
+*.swo
+
+# Claude — keep .claude/agents, commands, skills, settings.local.json under version control
+.claude/*.local
+.claude/local/
+
+# Python (training tooling lives outside the Rust workspace but may share the repo)
+__pycache__/
+*.pyc
+.venv/
+.python-version
