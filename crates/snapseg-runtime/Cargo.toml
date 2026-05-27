@@ -1,0 +1,27 @@
+[package]
+name = "snapseg-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "ONNX Runtime wrapper for snapseg: execution-provider selection and tensor plumbing."
+
+[dependencies]
+snapseg-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+ndarray.workspace = true
+tracing.workspace = true
+# ort = { workspace = true } # enabled when the first model adapter lands
+
+[features]
+default = []
+# Opt-in execution providers. CPU is always built. Others require the
+# matching system libraries / SDKs to be installed.
+# Wired up once `ort` is added back as a dependency.
+# coreml = ["ort/coreml"]
+# cuda = ["ort/cuda"]
+# directml = ["ort/directml"]
+# tensorrt = ["ort/tensorrt"]

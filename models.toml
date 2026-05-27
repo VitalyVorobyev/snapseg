@@ -1,0 +1,36 @@
+# Default snapseg model registry.
+#
+# Entries below are placeholders pending Phase-1 wiring: real URLs and
+# sha256 sums land once each adapter is plumbed against its exported ONNX
+# file. Until then the entries document the *shape* of the registry and
+# serve as fixtures for the resolver code.
+
+[[model]]
+name = "ritm-hrnet18-cocolvis"
+family = "ritm"
+url = "https://example.invalid/ritm-hrnet18-cocolvis.onnx"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+size_mb = 41
+input_size = [1024, 1024]
+license = "MIT"
+notes = "RITM HRNet-18 trained on COCO+LVIS. Click-driven, no box."
+
+[[model]]
+name = "focalclick-hrnet18s2"
+family = "focalclick"
+url = "https://example.invalid/focalclick-hrnet18s2.onnx"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+size_mb = 39
+input_size = [1024, 1024]
+license = "MIT"
+notes = "FocalClick HRNet18-S2. Local-crop refinement keeps subsequent clicks cheap on CPU."
+
+[[model]]
+name = "mobile-sam"
+family = "mobile_sam"
+url = "https://example.invalid/mobile_sam.onnx"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+size_mb = 41
+input_size = [1024, 1024]
+license = "Apache-2.0"
+notes = "Distilled SAM with TinyViT encoder. Click + box prompts."

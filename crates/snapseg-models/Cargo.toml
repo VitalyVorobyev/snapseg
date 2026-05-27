@@ -1,0 +1,17 @@
+[package]
+name = "snapseg-models"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Per-family adapters (RITM, FocalClick, MobileSAM, EfficientSAM, ...) implementing InteractiveSegmenter."
+
+[dependencies]
+snapseg-core.workspace = true
+snapseg-runtime.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+ndarray.workspace = true
+tracing.workspace = true
