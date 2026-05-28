@@ -18,6 +18,7 @@
 //! the foreseeable future; bump only for breaking changes.
 
 pub mod coco;
+pub use coco::ConversionReport;
 mod prompts;
 mod save;
 mod types;

@@ -1,32 +1,76 @@
 //! Central image canvas: fits the source image into the available
-//! area, paints the segmentation overlay, captures clicks, and draws
-//! the prompt markers.
+//! area, paints the segmentation overlay, captures clicks, draws the
+//! prompt markers, and tracks zoom/pan + hover state.
 //!
 //! `draw_canvas` is a method on `SnapsegApp` because every step pokes
 //! at app state; the geometry-only helpers live in [`crate::coords`]
 //! and the texture builders in [`crate::textures`].
+//!
+//! ## Input bindings
+//!
+//! - Primary click: append a prompt of the current polarity.
+//! - Secondary (right) click: append the opposite polarity.
+//! - Mouse wheel (vertical scroll): zoom around the cursor.
+//! - Middle-button drag: pan the view.
+//! - Double-click (primary): reset zoom + pan to the fit baseline.
+//!
+//! Why middle-button drag instead of space-drag: middle-button is a
+//! single-input gesture and doesn't conflict with potential
+//! keyboard-driven mask/vertex cycling on the side panel. Space-drag
+//! would have stolen `Space` from any future keyboard shortcut.
 
 use eframe::egui;
 use snapseg_core::{Point2, Polarity, Prompt};
 
 use crate::app::SnapsegApp;
-use crate::coords::{fit_rect, image_to_screen, opposite, screen_to_image};
+use crate::coords::{
+    ViewState, fit_rect, image_to_screen, opposite, screen_to_image, view_rect, zoom_around,
+};
 
 impl SnapsegApp {
-    /// Render the image, the mask overlay, and the prompt markers,
-    /// and capture clicks. Primary mouse contributes a click of the
-    /// current polarity; secondary mouse contributes the opposite.
+    /// Render the image, the mask overlay, the prompt markers, and
+    /// the polygon, captures clicks, and updates `view_state` for any
+    /// mouse-wheel / drag / double-click gestures.
+    // why this is long: the canvas owns six concerns (allocation,
+    // gesture handling, mask paint, click capture, polygon paint,
+    // prompt paint) that pass the same `display_rect` / `img_size`
+    // pair around. Splitting them would force every helper to take a
+    // 5-arg geometry tuple, which is worse than one method per
+    // gesture class.
     pub(crate) fn draw_canvas(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let Some(img) = &self.image else { return };
+        // Extract image-derived data up front so the rest of the
+        // method can take `&mut self` freely without fighting the
+        // image borrow.
+        let (img_w, img_h, img_tex_id) = match self.image.as_ref() {
+            Some(img) => (img.gray.width, img.gray.height, img.texture.id()),
+            None => return,
+        };
+        let img_size = egui::vec2(img_w as f32, img_h as f32);
 
         let avail = ui.available_size();
-        let img_size = egui::vec2(img.gray.width as f32, img.gray.height as f32);
-        let display_rect = fit_rect(img_size, avail, ui.cursor().min);
+        let origin = ui.cursor().min;
+        let fit = fit_rect(img_size, avail, origin);
+        let allocated = egui::Rect::from_min_size(origin, avail);
 
-        let response = ui.allocate_rect(display_rect, egui::Sense::click());
-        let painter = ui.painter_at(display_rect);
+        // Allocate the *whole* available area so wheel/drag/hover work
+        // even when the cursor is outside the (possibly shrunk) image
+        // rect. Clicks are gated to inside the image rect below.
+        let response = ui.allocate_rect(allocated, egui::Sense::click_and_drag());
+        let painter = ui.painter_at(allocated);
 
-        paint_image(&painter, img.texture.id(), display_rect);
+        // Gesture handling. Run before paint so zoom/pan from this
+        // frame's input affects this frame's image position (avoids a
+        // one-frame lag).
+        self.view = compute_new_view(self.view, &response, ctx, fit, allocated);
+        // Re-derive display rect after gestures so paint + click use
+        // the same transform the gesture just applied.
+        let display_rect = view_rect(self.view, fit, allocated);
+
+        // Update hover readout. Off-image hover clears the readout
+        // (the side panel decides whether to render it).
+        self.hover_pixel = compute_hover_pixel(&response, display_rect, img_size, img_w, img_h);
+
+        paint_image(&painter, img_tex_id, display_rect);
         if let Some(mask_tex) = &self.mask_texture {
             paint_image(&painter, mask_tex.id(), display_rect);
         }
@@ -35,12 +79,111 @@ impl SnapsegApp {
         if let Some(polygon) = &self.refined_polygon {
             paint_polygon(&painter, &polygon.vertices, display_rect, img_size);
         }
+        // Selected-vertex dot drawn LAST so it sits on top of the gold
+        // contour and the prompt markers (the contour is more important
+        // than the prompt markers for vertex editing).
+        if let Some(idx) = self.selected_vertex_idx {
+            if let Some(polygon) = &self.refined_polygon {
+                if let Some(v) = polygon.vertices.get(idx) {
+                    let screen = image_to_screen(*v, display_rect, img_size);
+                    painter.circle_filled(screen, 5.0, egui::Color32::from_rgb(255, 80, 220));
+                    painter.circle_stroke(
+                        screen,
+                        5.0,
+                        egui::Stroke::new(1.5, egui::Color32::BLACK),
+                    );
+                }
+            }
+        }
         paint_prompts(&painter, &self.session.prompts, display_rect, img_size);
 
         if clicked {
             self.run_segment(ctx);
         }
     }
+}
+
+/// Fold mouse-wheel zoom, middle-button drag pan, and double-click
+/// reset into a new [`ViewState`]. Pure on the inputs (`view`,
+/// `response`, `ctx.input`), so it composes cleanly without sharing
+/// `&mut self` with the rest of the frame.
+fn compute_new_view(
+    view: ViewState,
+    response: &egui::Response,
+    ctx: &egui::Context,
+    fit: egui::Rect,
+    allocated: egui::Rect,
+) -> ViewState {
+    // Double-click takes precedence — if the operator just
+    // double-clicked to reset, we want the identity view regardless of
+    // any drag or wheel input on the same frame.
+    if response.double_clicked() {
+        return ViewState::default();
+    }
+
+    let mut next = view;
+
+    // Mouse wheel → zoom around the cursor. egui delivers wheel ticks
+    // as `smooth_scroll_delta.y`; positive = scroll up = zoom in.
+    // Trackpads deliver fractional values, which the `zoom_around`
+    // clamp absorbs.
+    if response.hovered() {
+        let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
+        if scroll.abs() > 0.5 {
+            if let Some(cursor) = response.hover_pos() {
+                // Each ~50 px of scroll ≈ exp(1) ≈ 2.72× zoom step;
+                // halve the rate to make trackpad scrolls feel
+                // proportional to mouse-wheel ticks.
+                let factor = (scroll / 120.0).exp();
+                next = zoom_around(next, factor, cursor, fit, allocated);
+            }
+        }
+    }
+
+    // Middle-button drag → pan. egui doesn't expose a per-button drag
+    // delta, so we sample `pointer.delta()` while the middle button is
+    // held.
+    let middle_drag =
+        ctx.input(|i| i.pointer.middle_down() && (i.pointer.delta() != egui::Vec2::ZERO));
+    if middle_drag && response.hovered() {
+        let delta = ctx.input(|i| i.pointer.delta());
+        next.pan += delta;
+        // Re-clamp by reading back the clamp offset from view_rect.
+        let unclamped = view_rect(next, fit, egui::Rect::EVERYTHING);
+        let clamped = view_rect(next, fit, allocated);
+        next.pan += clamped.min - unclamped.min;
+    }
+
+    next
+}
+
+/// Map the hover position from screen space into an integer image
+/// pixel `(x, y)`. Returns `None` if the cursor is off-image or
+/// outside the integer image bounds.
+fn compute_hover_pixel(
+    response: &egui::Response,
+    display_rect: egui::Rect,
+    img_size: egui::Vec2,
+    img_w: u32,
+    img_h: u32,
+) -> Option<(u32, u32)> {
+    if !response.hovered() {
+        return None;
+    }
+    let pos = response.hover_pos()?;
+    if !display_rect.contains(pos) {
+        return None;
+    }
+    let pt = screen_to_image(pos, display_rect, img_size);
+    if pt.x < 0.0 || pt.y < 0.0 {
+        return None;
+    }
+    let x = pt.x.floor() as i64;
+    let y = pt.y.floor() as i64;
+    if x < 0 || y < 0 || x >= img_w as i64 || y >= img_h as i64 {
+        return None;
+    }
+    Some((x as u32, y as u32))
 }
 
 fn paint_image(painter: &egui::Painter, id: egui::TextureId, rect: egui::Rect) {
@@ -52,7 +195,11 @@ fn paint_image(painter: &egui::Painter, id: egui::TextureId, rect: egui::Rect) {
     );
 }
 
-/// Returns true if a new click was appended to `app.session`.
+/// Returns true if a new click was appended to `app.session`. Only
+/// clicks inside the displayed image rect count; clicks in the
+/// surrounding allocated area (e.g. the dark margin around a non-
+/// fullscreen image) are ignored so panning and zooming don't
+/// accidentally inject prompts.
 fn capture_click(
     app: &mut SnapsegApp,
     response: &egui::Response,
@@ -62,11 +209,24 @@ fn capture_click(
     if !(response.clicked() || response.secondary_clicked()) {
         return false;
     }
+    // Drop the click if a drag is in progress so middle-button-drag
+    // pan doesn't end with a stray prompt.
+    if response.dragged() {
+        return false;
+    }
     let secondary = response.secondary_clicked();
     let Some(pos) = response.interact_pointer_pos() else {
         return false;
     };
+    if !display_rect.contains(pos) {
+        return false;
+    }
     let img_pt = screen_to_image(pos, display_rect, img_size);
+    // Discard clicks just outside the integer image bounds — the user
+    // probably caught the canvas margin.
+    if img_pt.x < 0.0 || img_pt.y < 0.0 || img_pt.x >= img_size.x || img_pt.y >= img_size.y {
+        return false;
+    }
     let polarity = if secondary {
         opposite(app.current_polarity)
     } else {

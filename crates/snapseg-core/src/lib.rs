@@ -110,9 +110,13 @@ impl Capabilities {
     }
 }
 
-/// A single grayscale image, stored as `u8`. We treat grayscale as the
-/// canonical format because the user's industrial pipeline is grayscale;
-/// adapters that need RGB replicate the channel internally.
+/// A single grayscale image, stored as `u8`. snapseg is grayscale-only
+/// by design (see `CLAUDE.md` "Image colour"): the operator-facing
+/// industrial pipeline is monochrome, and the workspace contract is
+/// this type. RGB-pretrained adapters (MobileSAM, RITM, FocalClick)
+/// replicate the channel internally via
+/// `snapseg-runtime::preprocess::gray_to_rgb_chw{,_byte}` at the model
+/// boundary — they don't see `GrayImage`'s shape change.
 #[derive(Debug, Clone)]
 pub struct GrayImage {
     pub width: u32,
@@ -131,14 +135,65 @@ impl GrayImage {
     }
 }
 
+/// One of the K masks predicted by a multi-mask model (canonical SAM /
+/// MobileSAM predict three candidates per click). Each carries the
+/// model's self-reported IoU estimate so a downstream consumer (the UI,
+/// active-learning, label-export) can rank or cycle through them.
+///
+/// Single-mask families (RITM, FocalClick) populate this with one
+/// element; the contract is "always non-empty when `mask` is".
+#[derive(Debug, Clone)]
+pub struct MaskCandidate {
+    /// Binary foreground mask at the source image resolution.
+    pub mask: Array2<bool>,
+    /// Raw logits at the source image resolution (pre-threshold).
+    pub logits: Array2<f32>,
+    /// Model-reported IoU prediction in `[0, 1]`. Single-mask families
+    /// report `1.0` (the model has no alternative to compare against).
+    pub iou: f32,
+}
+
 /// Output of one segmentation pass. The boolean mask is the headline
 /// artifact; `logits` is exposed for QA, active-learning sample selection,
 /// and as `prev_logits` for the next iteration.
+///
+/// Multi-mask families (SAM / MobileSAM) populate `candidates` with all
+/// K predictions; `mask` and `logits` mirror the selected candidate
+/// (argmax-IoU by default). Single-mask families populate `candidates`
+/// with one entry so the UI can iterate uniformly.
 #[derive(Debug, Clone)]
 pub struct SegmentationResult {
+    /// Selected mask. For multi-mask models this is the argmax-IoU
+    /// candidate; for single-mask models it's the sole prediction.
     pub mask: Array2<bool>,
+    /// Selected logits, paired with `mask`.
     pub logits: Array2<f32>,
+    /// Wall-clock duration of the inference call (encoder + decoder
+    /// time, but excluding pre-/post-processing on the caller side).
     pub inference_time: Duration,
+    /// All K candidate masks. Always non-empty when `mask` is set;
+    /// `candidates[0]` is not necessarily the selected one — see
+    /// [`SegmentationResult::selected_index`].
+    pub candidates: Vec<MaskCandidate>,
+}
+
+impl SegmentationResult {
+    /// Index of the selected candidate inside `candidates`, by IoU
+    /// argmax. Returns `0` for single-candidate results.
+    ///
+    /// The selection is recomputed on the fly rather than cached, so
+    /// callers that mutate `candidates` see a consistent answer.
+    pub fn selected_index(&self) -> usize {
+        let mut best = 0usize;
+        let mut best_iou = f32::NEG_INFINITY;
+        for (i, c) in self.candidates.iter().enumerate() {
+            if c.iou > best_iou {
+                best_iou = c.iou;
+                best = i;
+            }
+        }
+        best
+    }
 }
 
 /// Trait every model adapter implements. Split into a one-time `set_image`
@@ -149,6 +204,18 @@ pub trait InteractiveSegmenter: Send {
     fn capabilities(&self) -> Capabilities;
     fn set_image(&mut self, image: &GrayImage) -> Result<(), SegError>;
     fn segment(&mut self, session: &PromptSession) -> Result<SegmentationResult, SegError>;
+
+    /// Drop any per-prompt-session cached state (e.g. SAM's previous
+    /// low-res logits, RITM's previous-iteration mask) without
+    /// invalidating the encoder embedding or the image preprocessing.
+    /// Called when the UI clears the prompt session and the operator
+    /// starts segmenting a different object on the same image — without
+    /// this hook the next click would condition on the previous
+    /// object's mask, biasing the prediction.
+    ///
+    /// Default impl is a no-op so non-iterative adapters don't have to
+    /// override.
+    fn reset_prompt_state(&mut self) {}
 }
 
 /// Unified error type. Adapters and runtime can wrap their backend errors

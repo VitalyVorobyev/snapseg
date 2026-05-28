@@ -8,6 +8,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The runtime story is **all-Rust, no Python**: `ort` 2.x (load-dynamic) wraps onnxruntime; `egui` drives the desktop UI; `ndarray` is the tensor type; classical subpixel edge refinement sharpens the boundaries that go into labels. macOS dev expects `brew install onnxruntime`; Linux dev expects the distribution's onnxruntime package.
 
+### Image colour
+
+snapseg is **grayscale-only** by design. Industrial parts are predominantly monochrome and the operator-facing pixel data type `snapseg-core::GrayImage` (`Array2<u8>`) carries that contract through every crate. RGB-pretrained networks (MobileSAM, RITM, FocalClick) replicate the grayscale channel internally at the adapter boundary via `snapseg-runtime::preprocess::gray_to_rgb_chw_byte` / `gray_to_rgb_chw`. Don't introduce a colour image type, a `DynamicImage`, or per-channel storage in any workspace crate without an architect decision — colour support would ripple across every adapter, the label format (M2), and the fine-tune loop (M7). Revisit only if a candidate model family materially benefits from chroma; until then, the conversion happens at load time (see `crates/snapseg-app/src/textures.rs::load_image`).
+
 ## Build & test commands
 
 ```bash

@@ -163,6 +163,10 @@ quick-implementer.
 - Cloud-side inference. Everything is local.
 - Python *runtime* dependency in the shipped binary. Training tooling
   (M7) is Python; that's fine because it's offline.
+- Colour image input. snapseg is grayscale-only — `snapseg-core::GrayImage`
+  is the workspace contract and RGB-pretrained models replicate the
+  channel inside the adapter. See `CLAUDE.md` "Image colour" for the
+  full reasoning.
 
 ## Decisions parking lot
 

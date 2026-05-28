@@ -1,0 +1,31 @@
+# snapseg.toml — operator-local configuration. Copy to ./snapseg.toml
+# and edit. The real file is gitignored.
+
+# Where labels get saved when you click "Save label". Relative paths are
+# resolved from the process cwd.
+label_dir    = "./labels"
+
+# Whether the subpixel-edge refinement toggle starts on.
+refine_edges = true
+
+# Optional: absolute path to the libonnxruntime dylib. Set this when
+# the system-installed onnxruntime is ABI-incompatible with the pinned
+# `ort` crate (currently `2.0.0-rc.10`, wraps onnxruntime 1.22). On
+# macOS, Homebrew typically installs the newest onnxruntime, which
+# may be too new — download a 1.22 binary from
+# https://github.com/microsoft/onnxruntime/releases and point at it:
+#
+# onnxruntime_path = "vendor/onnxruntime-osx-arm64-1.22.0/lib/libonnxruntime.dylib"
+
+# Auto-load this model on startup. Comment out to fall back to the
+# "Load MobileSAM…" file picker every launch.
+[default_model]
+name       = "mobile-sam"
+family     = "mobile_sam"
+input_size = 1024
+
+# Per-part local ONNX paths. For MobileSAM: encoder + decoder. For
+# single-network families (ritm, focalclick): a single `model` key.
+[default_model.parts]
+encoder = "assets/mobile_sam_20230629/mobile_sam.encoder.onnx"
+decoder = "assets/mobile_sam_20230629/sam_vit_h_4b8939.decoder.onnx"

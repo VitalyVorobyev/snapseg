@@ -10,7 +10,9 @@ use std::path::PathBuf;
 
 use eframe::egui;
 
-use snapseg_core::{GrayImage, InteractiveSegmenter, Polarity, PromptSession};
+use snapseg_core::{GrayImage, InteractiveSegmenter, MaskCandidate, Polarity, PromptSession};
+
+use crate::coords::ViewState;
 
 /// Per-frame application state.
 ///
@@ -55,9 +57,17 @@ pub struct SnapsegApp {
     /// when a model is loaded.
     pub(crate) segmenter_registry_name: Option<String>,
     /// Cached SHA-256 of the encoder ONNX, if any. Set when loading.
+    /// Populated for SAM-family models that ship encoder + decoder
+    /// parts; `None` for single-network families.
     pub(crate) encoder_sha256: Option<String>,
     /// Cached SHA-256 of the decoder ONNX, if any. Set when loading.
+    /// Same population rule as [`Self::encoder_sha256`].
     pub(crate) decoder_sha256: Option<String>,
+    /// Cached SHA-256 of the single-network ONNX, if any. Set when
+    /// loading. Populated for single-network families (RITM,
+    /// FocalClick) where the registry's `parts["model"]` is the whole
+    /// graph; `None` for SAM-family models.
+    pub(crate) model_sha256: Option<String>,
     /// Most recent encoder pass duration (ms). Set by `run_set_image`.
     pub(crate) last_encoder_ms: Option<u64>,
     /// Most recent mask. Held so the user can save it as a label long
@@ -82,6 +92,33 @@ pub struct SnapsegApp {
     /// Knobs for the refinement pass. Defaults from
     /// [`snapseg_edges::RefineParams::default`].
     pub(crate) refine_params: snapseg_edges::RefineParams,
+    /// Model to auto-load on the first frame after construction.
+    /// Cleared after the first `tick_pending_autoload` call. Kept on
+    /// `SnapsegApp` rather than `with_config`'s scope so the
+    /// auto-load runs inside the egui event loop (where `ctx` exists
+    /// for texture uploads).
+    pub(crate) pending_autoload: Option<crate::config::ModelConfig>,
+    /// Zoom + pan applied to the canvas. Reset to identity on new
+    /// image / new model / double-click on the canvas.
+    pub(crate) view: ViewState,
+    /// Most recent hover position in image-pixel coordinates, if the
+    /// cursor is over the image rect. Cleared when the cursor leaves
+    /// the canvas; surfaced in the side panel's status section.
+    pub(crate) hover_pixel: Option<(u32, u32)>,
+    /// All K candidate masks from the latest `segment` call. Held so
+    /// the side-panel cycler can switch between them without re-running
+    /// inference. Cleared on new image / new prompts / model load.
+    pub(crate) last_candidates: Vec<MaskCandidate>,
+    /// Index into `last_candidates` of the currently selected mask.
+    /// Defaults to `argmax-IoU` after each `segment`; arrow keys /
+    /// radio buttons let the operator override. Out-of-range values
+    /// are tolerated (clamped at paint time).
+    pub(crate) selected_mask_idx: usize,
+    /// Index into `refined_polygon.vertices` of the currently selected
+    /// vertex, surfaced in the side panel and rendered as a filled dot
+    /// on top of the gold contour. `None` when no polygon is available
+    /// or the operator hasn't started cycling.
+    pub(crate) selected_vertex_idx: Option<usize>,
 }
 
 impl Default for SnapsegApp {
@@ -103,6 +140,7 @@ impl Default for SnapsegApp {
             segmenter_registry_name: None,
             encoder_sha256: None,
             decoder_sha256: None,
+            model_sha256: None,
             last_encoder_ms: None,
             last_mask: None,
             last_logits: None,
@@ -112,7 +150,31 @@ impl Default for SnapsegApp {
             refine_edges: false,
             refined_polygon: None,
             refine_params: snapseg_edges::RefineParams::default(),
+            pending_autoload: None,
+            view: ViewState::default(),
+            hover_pixel: None,
+            last_candidates: Vec::new(),
+            selected_mask_idx: 0,
+            selected_vertex_idx: None,
         }
+    }
+}
+
+impl SnapsegApp {
+    /// Build from a loaded operator config. Applies overrides from the
+    /// config to the default-constructed app and schedules a deferred
+    /// auto-load of `default_model` on the first frame (see
+    /// [`SnapsegApp::tick_pending_autoload`]).
+    pub fn with_config(cfg: crate::config::AppConfig) -> Self {
+        let mut app = Self::default();
+        if let Some(dir) = cfg.label_dir {
+            app.label_dir = snapseg_labels::LabelDir::new(dir);
+        }
+        if let Some(refine) = cfg.refine_edges {
+            app.refine_edges = refine;
+        }
+        app.pending_autoload = cfg.default_model;
+        app
     }
 }
 
@@ -125,6 +187,8 @@ pub(crate) struct LoadedImage {
 
 impl eframe::App for SnapsegApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.tick_pending_autoload(ctx);
+
         egui::SidePanel::right("controls")
             .default_width(280.0)
             .show(ctx, |ui| self.draw_controls(ui, ctx));

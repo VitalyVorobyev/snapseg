@@ -28,14 +28,29 @@ pub struct ConvertOptions {
     /// Defaults to `true`; the rejected-as-good label is more harmful
     /// than the dropped-good-label is.
     pub skip_rejected: bool,
+    /// When `true`, the first per-label error aborts conversion.
+    /// When `false` (the default), per-label errors are logged via
+    /// `tracing::warn` and the bad label is skipped.
+    pub strict: bool,
 }
 
 impl Default for ConvertOptions {
     fn default() -> Self {
         Self {
             skip_rejected: true,
+            strict: false,
         }
     }
+}
+
+/// Result of a successful [`convert_dir`] call.
+#[derive(Debug)]
+pub struct ConversionReport {
+    /// The assembled COCO dataset.
+    pub dataset: CocoDataset,
+    /// Number of label directories that errored and were skipped.
+    /// Always `0` in strict mode (any error aborts conversion).
+    pub skipped: usize,
 }
 
 /// Top-level COCO dataset. Matches the canonical
@@ -143,7 +158,8 @@ pub struct CocoCategory {
 }
 
 /// Convert every label directory under `label_root` into a
-/// [`CocoDataset`].
+/// [`ConversionReport`] containing the assembled [`CocoDataset`] and
+/// the count of labels skipped due to errors.
 ///
 /// Iteration is sorted by directory name so the output is
 /// deterministic across runs. Directory entries whose name ends with
@@ -153,58 +169,104 @@ pub struct CocoCategory {
 /// `image_id` and `annotation_id` start at `1` and increment in
 /// lockstep — one image per annotation for now.
 ///
+/// When [`ConvertOptions::strict`] is `false` (the default), a
+/// per-label parse or I/O error is logged via `tracing::warn` and
+/// the label is skipped; the returned `skipped` count reflects how
+/// many were dropped this way. When `strict` is `true`, the first
+/// per-label error aborts conversion and propagates as `Err`.
+///
 /// # Errors
 ///
 /// - [`LabelError::Io`] if `label_root` cannot be read or a label
 ///   directory cannot be opened.
-/// - [`LabelError::TomlDe`] / [`LabelError::Json`] /
-///   [`LabelError::Image`] when an individual label's `meta.toml`,
-///   `prompts.json`, or `mask.png` is corrupt.
-/// - [`LabelError::MissingArtifact`] when a per-label file is absent.
-/// - [`LabelError::MaskFormat`] when a mask's dimensions disagree with
-///   the source image's dimensions in `meta.toml`.
-pub fn convert_dir(label_root: &Path, opts: ConvertOptions) -> Result<CocoDataset, LabelError> {
+/// - Per-label [`LabelError::TomlDe`] / [`LabelError::Json`] /
+///   [`LabelError::Image`] / [`LabelError::MissingArtifact`] /
+///   [`LabelError::MaskFormat`] only propagate in strict mode; in
+///   lenient mode they are logged and counted in `skipped`.
+pub fn convert_dir(
+    label_root: &Path,
+    opts: ConvertOptions,
+) -> Result<ConversionReport, LabelError> {
     let entries = sorted_label_dirs(label_root)?;
 
     let mut images: Vec<CocoImage> = Vec::new();
     let mut annotations: Vec<CocoAnnotation> = Vec::new();
     let mut next_id: u64 = 1;
+    let mut skipped: usize = 0;
 
     for dir in entries {
-        let meta = read_meta(&dir)?;
-        if opts.skip_rejected && matches!(meta.operator.quality, LabelQuality::Reject) {
-            continue;
+        // skip_rejected is not an error; it does not count toward skipped.
+        match read_meta(&dir) {
+            Ok(meta)
+                if opts.skip_rejected && matches!(meta.operator.quality, LabelQuality::Reject) =>
+            {
+                continue;
+            }
+            Ok(meta) => match per_label_work(&dir, meta, next_id) {
+                Ok((image, annotation)) => {
+                    images.push(image);
+                    annotations.push(annotation);
+                    next_id += 1;
+                }
+                Err(e) => {
+                    if opts.strict {
+                        return Err(e);
+                    }
+                    tracing::warn!(label = %dir.display(), error = %e, "skipping malformed label");
+                    skipped += 1;
+                }
+            },
+            Err(e) => {
+                if opts.strict {
+                    return Err(e);
+                }
+                tracing::warn!(label = %dir.display(), error = %e, "skipping malformed label");
+                skipped += 1;
+            }
         }
-        let (image, annotation) = label_to_coco_entries(&dir, meta, next_id, next_id)?;
-        images.push(image);
-        annotations.push(annotation);
-        next_id += 1;
     }
 
-    Ok(CocoDataset {
-        info: CocoInfo {
-            description: "snapseg labels exported to COCO".to_string(),
-            version: "1.0".to_string(),
-            schema_version: SCHEMA_VERSION.to_string(),
-            year: chrono::Utc::now()
-                .format("%Y")
-                .to_string()
-                .parse::<u32>()
-                .unwrap_or(0),
+    Ok(ConversionReport {
+        dataset: CocoDataset {
+            info: CocoInfo {
+                description: "snapseg labels exported to COCO".to_string(),
+                version: "1.0".to_string(),
+                schema_version: SCHEMA_VERSION.to_string(),
+                year: chrono::Utc::now()
+                    .format("%Y")
+                    .to_string()
+                    .parse::<u32>()
+                    .unwrap_or(0),
+            },
+            images,
+            annotations,
+            categories: vec![CocoCategory {
+                id: 1,
+                name: "foreground".to_string(),
+                supercategory: "snapseg".to_string(),
+            }],
         },
-        images,
-        annotations,
-        categories: vec![CocoCategory {
-            id: 1,
-            name: "foreground".to_string(),
-            supercategory: "snapseg".to_string(),
-        }],
+        skipped,
     })
+}
+
+/// Process one label directory into a `(CocoImage, CocoAnnotation)` pair.
+///
+/// Reads and validates all label artifacts; returns `Err` on any
+/// parse, I/O, or dimension mismatch. The caller decides whether to
+/// propagate or skip based on [`ConvertOptions::strict`].
+fn per_label_work(
+    dir: &Path,
+    meta: Provenance,
+    id: u64,
+) -> Result<(CocoImage, CocoAnnotation), LabelError> {
+    label_to_coco_entries(dir, meta, id, id)
 }
 
 /// Convert + write `label_root` to `out_path` as pretty JSON.
 ///
-/// Returns the number of labels included in the dataset.
+/// Returns a [`ConversionReport`] containing the dataset and the count
+/// of labels skipped due to errors (see [`convert_dir`]).
 ///
 /// # Errors
 ///
@@ -214,11 +276,11 @@ pub fn convert_dir_to_file(
     label_root: &Path,
     out_path: &Path,
     opts: ConvertOptions,
-) -> Result<usize, LabelError> {
-    let ds = convert_dir(label_root, opts)?;
-    let json = serde_json::to_string_pretty(&ds)?;
+) -> Result<ConversionReport, LabelError> {
+    let report = convert_dir(label_root, opts)?;
+    let json = serde_json::to_string_pretty(&report.dataset)?;
     fs::write(out_path, json)?;
-    Ok(ds.images.len())
+    Ok(report)
 }
 
 /// List every plausible per-label subdirectory under `label_root`,
@@ -589,7 +651,9 @@ mod tests {
             "polygon.json should not exist when polygon arg is None"
         );
 
-        let ds = convert_dir(tmp.path(), ConvertOptions::default()).expect("convert_dir");
+        let report = convert_dir(tmp.path(), ConvertOptions::default()).expect("convert_dir");
+        let ds = &report.dataset;
+        assert_eq!(report.skipped, 0);
 
         assert_eq!(ds.images.len(), 1);
         assert_eq!(ds.annotations.len(), 1);
@@ -691,23 +755,28 @@ mod tests {
             tmp.path(),
             ConvertOptions {
                 skip_rejected: true,
+                strict: false,
             },
         )
         .expect("convert with skip");
-        assert_eq!(with_skip.images.len(), 1);
-        assert_eq!(with_skip.annotations.len(), 1);
+        assert_eq!(with_skip.dataset.images.len(), 1);
+        assert_eq!(with_skip.dataset.annotations.len(), 1);
+        assert_eq!(with_skip.skipped, 0);
 
         let no_skip = convert_dir(
             tmp.path(),
             ConvertOptions {
                 skip_rejected: false,
+                strict: false,
             },
         )
         .expect("convert without skip");
-        assert_eq!(no_skip.images.len(), 2);
-        assert_eq!(no_skip.annotations.len(), 2);
+        assert_eq!(no_skip.dataset.images.len(), 2);
+        assert_eq!(no_skip.dataset.annotations.len(), 2);
+        assert_eq!(no_skip.skipped, 0);
         // Both ids must be present in the no-skip output.
         let names: Vec<&str> = no_skip
+            .dataset
             .images
             .iter()
             .map(|i| i.file_name.as_str())
@@ -738,9 +807,10 @@ mod tests {
         // Orphan .partial/ from a hypothetical crashed write.
         fs::create_dir_all(tmp.path().join("orphan.partial")).expect("mkdir partial");
 
-        let ds = convert_dir(tmp.path(), ConvertOptions::default()).expect("convert_dir");
-        assert_eq!(ds.images.len(), 1);
-        assert_eq!(ds.annotations.len(), 1);
+        let report = convert_dir(tmp.path(), ConvertOptions::default()).expect("convert_dir");
+        assert_eq!(report.dataset.images.len(), 1);
+        assert_eq!(report.dataset.annotations.len(), 1);
+        assert_eq!(report.skipped, 0);
     }
 
     #[test]
@@ -774,7 +844,9 @@ mod tests {
         )
         .expect("save");
 
-        let ds = convert_dir(tmp.path(), ConvertOptions::default()).expect("convert_dir");
+        let report = convert_dir(tmp.path(), ConvertOptions::default()).expect("convert_dir");
+        let ds = &report.dataset;
+        assert_eq!(report.skipped, 0);
         assert_eq!(ds.annotations.len(), 1);
         let ann = &ds.annotations[0];
 
@@ -846,5 +918,78 @@ mod tests {
         ];
         let counts = encode_rle(&mask, 2, 2);
         assert_eq!(counts, vec![0, 1, 3], "got {counts:?}");
+    }
+
+    #[test]
+    fn convert_skips_corrupt_label_in_default_mode() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut dir = LabelDir::new(tmp.path().to_path_buf());
+
+        // Save one good label.
+        let gray = make_gray_4x4();
+        let mask = make_mask_4x4();
+        let (session, offsets) = one_click();
+        let prompts = prompts_to_json(&session, &offsets).expect("prompts_to_json");
+        dir.save(
+            None,
+            &gray,
+            prompts,
+            &mask,
+            None,
+            None,
+            make_inputs(LabelQuality::Good),
+        )
+        .expect("save good");
+
+        // Create a sibling directory with a corrupt meta.toml so that
+        // the sorted traversal encounters it (name "corrupt" sorts before
+        // typical sha8 names).
+        let corrupt_dir = tmp.path().join("0corrupt");
+        fs::create_dir_all(&corrupt_dir).expect("mkdir corrupt");
+        fs::write(corrupt_dir.join("meta.toml"), b"this is not toml!@#$").expect("write bad toml");
+        // Provide the other expected artifacts so only meta.toml is corrupt.
+        let small_png: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, // PNG sig
+            0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, // IHDR length + type
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1x1
+            0x08, 0x00, 0x00, 0x00, 0x00, 0x3a, 0x7e, 0x9b,
+            0x55, // bit depth=8, color=Gray, crc
+            0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, // IDAT length + type
+            0x78, 0x9c, 0x62, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, // zlib-compressed 1 pixel
+            0xe2, 0x21, 0xbc, 0x33, // IDAT crc
+            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82, // IEND
+        ];
+        fs::write(corrupt_dir.join("image.png"), small_png).expect("write image.png");
+        fs::write(corrupt_dir.join("mask.png"), small_png).expect("write mask.png");
+        fs::write(corrupt_dir.join("prompts.json"), b"[]").expect("write prompts.json");
+
+        // Lenient mode (default): returns Ok with the one good image, skipped == 1.
+        let report = convert_dir(tmp.path(), ConvertOptions::default())
+            .expect("lenient convert should succeed");
+        assert_eq!(
+            report.dataset.images.len(),
+            1,
+            "expected one good image, got {:?}",
+            report
+                .dataset
+                .images
+                .iter()
+                .map(|i| &i.file_name)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(report.skipped, 1, "expected 1 skipped label");
+
+        // Strict mode: returns Err on the corrupt label.
+        let strict_result = convert_dir(
+            tmp.path(),
+            ConvertOptions {
+                strict: true,
+                ..ConvertOptions::default()
+            },
+        );
+        assert!(
+            strict_result.is_err(),
+            "strict mode should abort on corrupt label"
+        );
     }
 }
