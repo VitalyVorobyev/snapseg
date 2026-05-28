@@ -57,9 +57,17 @@ pub struct SnapsegApp {
     /// when a model is loaded.
     pub(crate) segmenter_registry_name: Option<String>,
     /// Cached SHA-256 of the encoder ONNX, if any. Set when loading.
+    /// Populated for SAM-family models that ship encoder + decoder
+    /// parts; `None` for single-network families.
     pub(crate) encoder_sha256: Option<String>,
     /// Cached SHA-256 of the decoder ONNX, if any. Set when loading.
+    /// Same population rule as [`Self::encoder_sha256`].
     pub(crate) decoder_sha256: Option<String>,
+    /// Cached SHA-256 of the single-network ONNX, if any. Set when
+    /// loading. Populated for single-network families (RITM,
+    /// FocalClick) where the registry's `parts["model"]` is the whole
+    /// graph; `None` for SAM-family models.
+    pub(crate) model_sha256: Option<String>,
     /// Most recent encoder pass duration (ms). Set by `run_set_image`.
     pub(crate) last_encoder_ms: Option<u64>,
     /// Most recent mask. Held so the user can save it as a label long
@@ -132,6 +140,7 @@ impl Default for SnapsegApp {
             segmenter_registry_name: None,
             encoder_sha256: None,
             decoder_sha256: None,
+            model_sha256: None,
             last_encoder_ms: None,
             last_mask: None,
             last_logits: None,

@@ -129,8 +129,13 @@ pub(crate) fn try_load_model(
     parts: HashMap<String, PathBuf>,
 ) {
     // Hash whichever part files are present for label provenance.
+    // SAM-family models populate `encoder` + `decoder`; single-network
+    // families (RITM, FocalClick) populate `model`. We hash every
+    // known slot so any future split or fusion of parts still traces
+    // back to a digest in the saved label.
     let encoder_sha256 = parts.get("encoder").and_then(|p| compute_sha256(p).ok());
     let decoder_sha256 = parts.get("decoder").and_then(|p| compute_sha256(p).ok());
+    let model_sha256 = parts.get("model").and_then(|p| compute_sha256(p).ok());
 
     let config = RuntimeConfig::default();
 
@@ -175,6 +180,7 @@ pub(crate) fn try_load_model(
             app.segmenter_registry_name = Some(name);
             app.encoder_sha256 = encoder_sha256;
             app.decoder_sha256 = decoder_sha256;
+            app.model_sha256 = model_sha256;
             app.embedding_ready = false;
             app.error = None;
             app.segmenter = Some(seg);

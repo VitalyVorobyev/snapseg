@@ -204,6 +204,18 @@ pub trait InteractiveSegmenter: Send {
     fn capabilities(&self) -> Capabilities;
     fn set_image(&mut self, image: &GrayImage) -> Result<(), SegError>;
     fn segment(&mut self, session: &PromptSession) -> Result<SegmentationResult, SegError>;
+
+    /// Drop any per-prompt-session cached state (e.g. SAM's previous
+    /// low-res logits, RITM's previous-iteration mask) without
+    /// invalidating the encoder embedding or the image preprocessing.
+    /// Called when the UI clears the prompt session and the operator
+    /// starts segmenting a different object on the same image — without
+    /// this hook the next click would condition on the previous
+    /// object's mask, biasing the prediction.
+    ///
+    /// Default impl is a no-op so non-iterative adapters don't have to
+    /// override.
+    fn reset_prompt_state(&mut self) {}
 }
 
 /// Unified error type. Adapters and runtime can wrap their backend errors

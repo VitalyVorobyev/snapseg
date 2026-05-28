@@ -62,6 +62,13 @@ impl SnapsegApp {
             self.last_candidates.clear();
             self.selected_mask_idx = 0;
             self.selected_vertex_idx = None;
+            // Iterative adapters (MobileSAM, RITM) cache the previous
+            // call's mask as a refinement prior. Drop it here so the
+            // first click of a fresh prompt session doesn't condition
+            // on the prior object's mask.
+            if let Some(seg) = self.segmenter.as_mut() {
+                seg.reset_prompt_state();
+            }
         }
 
         ui.add_space(8.0);

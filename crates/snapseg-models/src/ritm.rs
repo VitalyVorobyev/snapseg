@@ -288,6 +288,16 @@ impl InteractiveSegmenter for RitmSegmenter {
         Ok(())
     }
 
+    fn reset_prompt_state(&mut self) {
+        // Drop the previous-iteration logits so the next `segment` call
+        // feeds a zero `prev_mask` to the network. The cached
+        // letterboxed image tensor and its resize info stay — they
+        // depend only on the source image, not on the prompt history.
+        if let Some(state) = self.state.as_mut() {
+            state.prev_logits = None;
+        }
+    }
+
     fn segment(&mut self, session: &PromptSession) -> Result<SegmentationResult, SegError> {
         let started = Instant::now();
         let state = self.state.as_mut().ok_or(SegError::NoImage)?;

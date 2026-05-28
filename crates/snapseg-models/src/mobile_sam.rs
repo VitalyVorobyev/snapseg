@@ -161,6 +161,15 @@ impl InteractiveSegmenter for MobileSamSegmenter {
         Ok(())
     }
 
+    fn reset_prompt_state(&mut self) {
+        // Drop the previous-iteration low-res mask but keep the cached
+        // encoder embedding so the next click doesn't pay for another
+        // encoder pass. Called when the UI clears the prompt session.
+        if let Some(state) = self.state.as_mut() {
+            state.prev_low_res = None;
+        }
+    }
+
     fn segment(&mut self, session: &PromptSession) -> Result<SegmentationResult, SegError> {
         let started = Instant::now();
         let state = self.state.as_mut().ok_or(SegError::NoImage)?;

@@ -34,7 +34,7 @@ pub(crate) fn build_provenance_inputs(app: &SnapsegApp) -> ProvenanceInputs {
             family,
             encoder_sha256: app.encoder_sha256.clone(),
             decoder_sha256: app.decoder_sha256.clone(),
-            model_sha256: None,
+            model_sha256: app.model_sha256.clone(),
         },
         runtime: RuntimeProvenance {
             // TODO(M5): wire from Backend::execution_provider when the
