@@ -41,6 +41,11 @@ impl SnapsegApp {
                 self.last_inference_ms = None;
                 self.embedding_ready = false;
                 self.error = None;
+                // Reset the view so a new image always starts at fit-
+                // to-window — otherwise a zoomed-in view of the previous
+                // image leaks into the new one.
+                self.view = crate::coords::ViewState::default();
+                self.hover_pixel = None;
                 self.run_set_image();
             }
             Err(e) => {
@@ -69,7 +74,7 @@ impl SnapsegApp {
             self,
             "mobile-sam".to_string(),
             "mobile_sam".to_string(),
-            1024,
+            (1024, 1024),
             parts,
         );
     }
@@ -95,7 +100,13 @@ impl SnapsegApp {
         let Some(cfg) = self.pending_autoload.take() else {
             return;
         };
-        try_load_model(self, cfg.name, cfg.family, cfg.input_size, cfg.parts);
+        try_load_model(
+            self,
+            cfg.name,
+            cfg.family,
+            cfg.input_size.as_hw(),
+            cfg.parts,
+        );
     }
 }
 
@@ -114,7 +125,7 @@ pub(crate) fn try_load_model(
     app: &mut SnapsegApp,
     name: String,
     family: String,
-    input_size: u32,
+    input_shape: (u32, u32),
     parts: HashMap<String, PathBuf>,
 ) {
     // Hash whichever part files are present for label provenance.
@@ -123,16 +134,36 @@ pub(crate) fn try_load_model(
 
     let config = RuntimeConfig::default();
 
+    // RITM / FocalClick still take a scalar `input_size` (their stubs
+    // expect a square canvas — non-square support arrives with M6). For
+    // those families we collapse to the longest side and warn if the
+    // operator asked for a non-square shape.
+    let scalar_input = if input_shape.0 == input_shape.1 {
+        input_shape.0
+    } else {
+        tracing::warn!(
+            h = input_shape.0,
+            w = input_shape.1,
+            family = %family,
+            "non-square input_shape collapsed to longest side for non-SAM family"
+        );
+        input_shape.0.max(input_shape.1)
+    };
+
     let result: Result<Box<dyn InteractiveSegmenter>, String> = match family.as_str() {
-        "mobile_sam" => MobileSamSegmenter::from_parts(name.clone(), &parts, input_size, &config)
-            .map(|s| Box::new(s) as Box<dyn InteractiveSegmenter>)
-            .map_err(|e| format!("MobileSAM load: {e}")),
-        "ritm" => RitmSegmenter::from_parts(name.clone(), &parts, input_size, &config)
+        "mobile_sam" => {
+            MobileSamSegmenter::from_parts_with_shape(name.clone(), &parts, input_shape, &config)
+                .map(|s| Box::new(s) as Box<dyn InteractiveSegmenter>)
+                .map_err(|e| format!("MobileSAM load: {e}"))
+        }
+        "ritm" => RitmSegmenter::from_parts(name.clone(), &parts, scalar_input, &config)
             .map(|s| Box::new(s) as Box<dyn InteractiveSegmenter>)
             .map_err(|e| format!("RITM load: {e}")),
-        "focalclick" => FocalClickSegmenter::from_parts(name.clone(), &parts, input_size, &config)
-            .map(|s| Box::new(s) as Box<dyn InteractiveSegmenter>)
-            .map_err(|e| format!("FocalClick load: {e}")),
+        "focalclick" => {
+            FocalClickSegmenter::from_parts(name.clone(), &parts, scalar_input, &config)
+                .map(|s| Box::new(s) as Box<dyn InteractiveSegmenter>)
+                .map_err(|e| format!("FocalClick load: {e}"))
+        }
         other => Err(format!("unknown family '{other}'")),
     };
 
@@ -147,6 +178,13 @@ pub(crate) fn try_load_model(
             app.embedding_ready = false;
             app.error = None;
             app.segmenter = Some(seg);
+            // Mask candidates from the previous model are stale; clear
+            // them along with the view so the side-panel cycler doesn't
+            // hold dangling references and the canvas starts fresh.
+            app.last_candidates.clear();
+            app.selected_mask_idx = 0;
+            app.selected_vertex_idx = None;
+            app.view = crate::coords::ViewState::default();
             app.run_set_image();
         }
         Err(e) => {

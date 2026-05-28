@@ -10,7 +10,9 @@ use std::path::PathBuf;
 
 use eframe::egui;
 
-use snapseg_core::{GrayImage, InteractiveSegmenter, Polarity, PromptSession};
+use snapseg_core::{GrayImage, InteractiveSegmenter, MaskCandidate, Polarity, PromptSession};
+
+use crate::coords::ViewState;
 
 /// Per-frame application state.
 ///
@@ -88,6 +90,27 @@ pub struct SnapsegApp {
     /// auto-load runs inside the egui event loop (where `ctx` exists
     /// for texture uploads).
     pub(crate) pending_autoload: Option<crate::config::ModelConfig>,
+    /// Zoom + pan applied to the canvas. Reset to identity on new
+    /// image / new model / double-click on the canvas.
+    pub(crate) view: ViewState,
+    /// Most recent hover position in image-pixel coordinates, if the
+    /// cursor is over the image rect. Cleared when the cursor leaves
+    /// the canvas; surfaced in the side panel's status section.
+    pub(crate) hover_pixel: Option<(u32, u32)>,
+    /// All K candidate masks from the latest `segment` call. Held so
+    /// the side-panel cycler can switch between them without re-running
+    /// inference. Cleared on new image / new prompts / model load.
+    pub(crate) last_candidates: Vec<MaskCandidate>,
+    /// Index into `last_candidates` of the currently selected mask.
+    /// Defaults to `argmax-IoU` after each `segment`; arrow keys /
+    /// radio buttons let the operator override. Out-of-range values
+    /// are tolerated (clamped at paint time).
+    pub(crate) selected_mask_idx: usize,
+    /// Index into `refined_polygon.vertices` of the currently selected
+    /// vertex, surfaced in the side panel and rendered as a filled dot
+    /// on top of the gold contour. `None` when no polygon is available
+    /// or the operator hasn't started cycling.
+    pub(crate) selected_vertex_idx: Option<usize>,
 }
 
 impl Default for SnapsegApp {
@@ -119,6 +142,11 @@ impl Default for SnapsegApp {
             refined_polygon: None,
             refine_params: snapseg_edges::RefineParams::default(),
             pending_autoload: None,
+            view: ViewState::default(),
+            hover_pixel: None,
+            last_candidates: Vec::new(),
+            selected_mask_idx: 0,
+            selected_vertex_idx: None,
         }
     }
 }

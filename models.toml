@@ -32,13 +32,26 @@ name = "ritm-hrnet18-cocolvis"
 family = "ritm"
 input_size = [1024, 1024]
 license = "MIT"
-notes = "RITM HRNet-18 on COCO+LVIS. Click-driven; one network call per click. manual install — see README"
+notes = "RITM HRNet-18 on COCO+LVIS, saic-vul Separate schema (image+click_map+prev_mask). Click-driven; one network call per click. manual install — see README"
 
 [[model.parts]]
 name = "model"
 url = ""
 sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 size_mb = 41
+
+[[model]]
+name = "ritm-hrnet32"
+family = "ritm"
+input_size = [1024, 1024]
+license = "MIT"
+notes = "RITM HRNet-32 community Fused4ch ONNX export. Single graph: image[1,4,H,W] + points[1,2M,3] + size[2]. manual install — see README"
+
+[[model.parts]]
+name = "model"
+url = ""
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+size_mb = 124
 
 [[model]]
 name = "focalclick-hrnet18s2"

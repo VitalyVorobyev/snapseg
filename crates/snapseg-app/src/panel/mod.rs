@@ -1,11 +1,19 @@
-//! Right-side controls panel and bottom status bar. Pure rendering of
-//! app state; no inference, no I/O.
+//! Right-side controls panel and bottom status bar. Split into
+//! [`view`] (View expander: pixel readout, mask cycler, vertex
+//! stepper, arrow-key shortcuts), [`labels`] (labels block: dir
+//! picker, quality, note, save) and this orchestrator (top buttons,
+//! polarity, prompt counter, refine toggle, latency, status bar).
+//! Cycler widgets call [`crate::app::SnapsegApp::select_mask`] to
+//! re-upload textures on candidate switch; the panel never invokes
+//! the segmenter itself.
+
+mod labels;
+mod view;
 
 use eframe::egui;
 use snapseg_core::Polarity;
 
 use crate::app::SnapsegApp;
-use crate::labels;
 
 impl SnapsegApp {
     /// Right side panel: open / load / polarity toggle / prompt counter
@@ -51,6 +59,9 @@ impl SnapsegApp {
             self.last_mask = None;
             self.last_logits = None;
             self.refined_polygon = None;
+            self.last_candidates.clear();
+            self.selected_mask_idx = 0;
+            self.selected_vertex_idx = None;
         }
 
         ui.add_space(8.0);
@@ -68,61 +79,7 @@ impl SnapsegApp {
             }
         ));
 
-        ui.add_space(8.0);
-        ui.separator();
-        ui.label(format!("Labels: {}", self.label_dir.root.display()));
-        if ui.button("Change…").clicked() {
-            self.pick_label_dir_dialog();
-        }
-
-        ui.add_space(4.0);
-        ui.label("Quality:");
-        ui.horizontal(|ui| {
-            ui.selectable_value(
-                &mut self.pending_quality,
-                snapseg_labels::LabelQuality::Good,
-                "Good",
-            );
-            ui.selectable_value(
-                &mut self.pending_quality,
-                snapseg_labels::LabelQuality::NeedsReview,
-                "Needs review",
-            );
-            ui.selectable_value(
-                &mut self.pending_quality,
-                snapseg_labels::LabelQuality::Reject,
-                "Reject",
-            );
-        });
-
-        ui.add_space(2.0);
-        ui.label("Note:");
-        ui.text_edit_singleline(&mut self.pending_note);
-
-        let save_enabled =
-            self.image.is_some() && self.last_mask.is_some() && self.segmenter_family.is_some();
-        ui.add_space(4.0);
-        if ui
-            .add_enabled(save_enabled, egui::Button::new("Save label"))
-            .clicked()
-        {
-            match labels::save_current_label(self) {
-                Ok(label) => {
-                    tracing::info!(id = %label.id, dir = %label.dir.display(), "label saved");
-                    self.last_save_status = Some(format!("Saved {}", label.id));
-                    self.pending_note.clear();
-                    self.pending_quality = snapseg_labels::LabelQuality::Good;
-                }
-                Err(e) => {
-                    tracing::error!("save label failed: {e}");
-                    self.last_save_status = Some(format!("Save failed: {e}"));
-                }
-            }
-        }
-        match &self.last_save_status {
-            Some(s) => ui.label(format!("Last save: {s}")),
-            None => ui.label("Last save: (none yet)"),
-        };
+        self.draw_labels_section(ui);
 
         ui.add_space(8.0);
         ui.separator();
@@ -132,9 +89,13 @@ impl SnapsegApp {
         let edge_off = prev_refine && !self.refine_edges;
         if edge_on {
             self.refine_now();
+            // Polygon just (re)materialised; reset the vertex cycler so
+            // the dot isn't stuck at a stale index.
+            self.selected_vertex_idx = None;
         }
         if edge_off {
             self.refined_polygon = None;
+            self.selected_vertex_idx = None;
         }
         if self.refine_edges {
             if let Some(p) = &self.refined_polygon {
@@ -149,6 +110,16 @@ impl SnapsegApp {
             ui.separator();
             ui.label(format!("Last segment: {ms} ms"));
         }
+
+        ui.add_space(8.0);
+        ui.separator();
+        // why this is a CollapsingHeader: side-panel real estate is at
+        // a premium and these three widgets cluster around the same
+        // "what does the canvas look like right now" question. Default
+        // open so first-time users see the affordances.
+        egui::CollapsingHeader::new("View")
+            .default_open(true)
+            .show(ui, |ui| self.draw_view_section(ui, ctx));
     }
 
     /// Re-read `./snapseg.toml` and re-apply. If the default_model

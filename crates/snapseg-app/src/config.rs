@@ -51,6 +51,42 @@ pub struct AppConfig {
     pub onnxruntime_path: Option<PathBuf>,
 }
 
+/// Encoder canvas the model was exported for.
+///
+/// The TOML side accepts two shapes via serde's untagged enum:
+///
+/// ```toml
+/// # Canonical, square SAM-style canvas.
+/// input_size = 1024
+///
+/// # Non-square canvas, ordered `[H, W]` (rows, columns) — matches
+/// # `orig_im_size` and `models.toml`'s registry array convention.
+/// input_size = [682, 1024]
+/// ```
+///
+/// Use [`InputSize::as_hw`] to read it back as a `(height, width)` tuple
+/// regardless of which shape the operator wrote.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(untagged)]
+pub enum InputSize {
+    /// Scalar form `input_size = 1024` — interpreted as a square `(N, N)`
+    /// canvas. Back-compatible with pre-2026-05 configs.
+    Square(u32),
+    /// Array form `input_size = [682, 1024]` — explicit `[H, W]`.
+    HW([u32; 2]),
+}
+
+impl InputSize {
+    /// Return the canvas as `(height, width)` regardless of which TOML
+    /// shape was written.
+    pub fn as_hw(&self) -> (u32, u32) {
+        match self {
+            InputSize::Square(n) => (*n, *n),
+            InputSize::HW([h, w]) => (*h, *w),
+        }
+    }
+}
+
 /// One model entry: same shape as a registry entry plus a per-part
 /// `local_path` map (the local-paths-only equivalent of `models.toml`'s
 /// download-able entries).
@@ -61,8 +97,9 @@ pub struct ModelConfig {
     pub name: String,
     /// Family slug — selects the adapter (`"mobile_sam"`, `"ritm"`, ...).
     pub family: String,
-    /// Square input edge length the model was exported for.
-    pub input_size: u32,
+    /// Encoder canvas (`[H, W]` or a scalar interpreted as a square).
+    /// See [`InputSize`] for the on-disk shapes accepted.
+    pub input_size: InputSize,
     /// `part_name → on-disk ONNX path`. For MobileSAM the keys are
     /// `"encoder"` and `"decoder"`; for single-network families (`ritm`,
     /// `focalclick`) the single key is `"model"`.
@@ -211,7 +248,28 @@ mod tests {
         let model = cfg.default_model.expect("default_model");
         assert_eq!(model.name, "mobile-sam");
         assert_eq!(model.family, "mobile_sam");
+        assert_eq!(model.input_size.as_hw(), (1024, 1024));
         assert_eq!(model.parts.len(), 2);
+    }
+
+    #[test]
+    fn non_square_input_size_parses() {
+        let f = write_tmp(
+            r#"
+            [default_model]
+            name = "mobile-sam"
+            family = "mobile_sam"
+            input_size = [682, 1024]
+
+            [default_model.parts]
+            encoder = "/tmp/e.onnx"
+            decoder = "/tmp/d.onnx"
+        "#,
+        );
+        let cfg = AppConfig::load_from(f.path()).expect("parse");
+        let model = cfg.default_model.expect("default_model");
+        // [H, W] — height first to match orig_im_size / registry.
+        assert_eq!(model.input_size.as_hw(), (682, 1024));
     }
 
     #[test]
