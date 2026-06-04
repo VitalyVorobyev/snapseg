@@ -21,12 +21,12 @@
 
 use ndarray::Array2;
 use snapseg_core::Point2;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// A directed cell-edge midpoint. Carries enough information to (a) snap to
 /// a unique integer key for graph dedup, and (b) materialise as an `(x, y)`
 /// half-pixel point.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct EdgeKey {
     /// `true` for horizontal cell edges (midpoint at `x + 0.5, y`),
     /// `false` for vertical cell edges (midpoint at `x, y + 0.5`).
@@ -146,8 +146,13 @@ fn push_segments(
 }
 
 /// Walk an undirected segment graph into closed polylines.
+///
+/// A `BTreeMap` (not `HashMap`) backs the adjacency so the start-edge search and
+/// traversal are in deterministic key order — contour extraction is otherwise
+/// nondeterministic across process runs (HashMap seed), which cascades into
+/// caliper/width results downstream.
 fn walk_polylines(segments: &[(EdgeKey, EdgeKey)]) -> Vec<Vec<Point2>> {
-    let mut adj: HashMap<EdgeKey, Vec<EdgeKey>> = HashMap::new();
+    let mut adj: BTreeMap<EdgeKey, Vec<EdgeKey>> = BTreeMap::new();
     for &(a, b) in segments {
         adj.entry(a).or_default().push(b);
         adj.entry(b).or_default().push(a);
@@ -184,12 +189,12 @@ fn walk_polylines(segments: &[(EdgeKey, EdgeKey)]) -> Vec<Vec<Point2>> {
     polylines
 }
 
-fn pop_neighbour(adj: &mut HashMap<EdgeKey, Vec<EdgeKey>>, k: EdgeKey) -> Option<EdgeKey> {
+fn pop_neighbour(adj: &mut BTreeMap<EdgeKey, Vec<EdgeKey>>, k: EdgeKey) -> Option<EdgeKey> {
     let list = adj.get_mut(&k)?;
     list.pop()
 }
 
-fn remove_one(adj: &mut HashMap<EdgeKey, Vec<EdgeKey>>, k: EdgeKey, target: EdgeKey) {
+fn remove_one(adj: &mut BTreeMap<EdgeKey, Vec<EdgeKey>>, k: EdgeKey, target: EdgeKey) {
     if let Some(list) = adj.get_mut(&k) {
         if let Some(pos) = list.iter().position(|&x| x == target) {
             list.swap_remove(pos);
